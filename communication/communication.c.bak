@@ -1,0 +1,5058 @@
+#include <config.h>
+#include <net_manager.h>
+#include <string.h>
+#include <communication.h>
+#include <para.h>
+#include <cardmanager.h>
+#include <store_manager.h>
+#include <sys/reboot.h>
+#include <gpio_manager.h>
+#include <pthread.h>     // pthread_*()
+
+
+static unsigned char  Pro_SOH  = 0xA6;
+static unsigned char BK_Pro_SOH 	= 0xA6;
+static PT_pcTxTime PcTxTime;
+
+static unsigned char BfCfFlag;			//布防撤防标志位；
+
+
+static unsigned char HEX_BCD(unsigned char bcd_data)
+{
+ 	unsigned char hex_data;
+    hex_data=(bcd_data/10)*16+bcd_data%10;
+	return hex_data;
+}
+
+
+/*
+打印日志到文件  liupeng add
+*/
+void pf(const char *str)
+{
+
+	FILE * fp;
+	fp = fopen("/opt/log.txt","a+");
+	
+    fprintf(fp,"%s\n",str);
+
+	fclose(fp);
+	
+	
+}
+
+/*
+添加一条红外透传数据到网关  0531 liupeng
+*/
+void addIR(PT_TCPWROpr ptTmp,PT_NetDeviceOpr ptNetDeviceOpr,unsigned char nameBuf[], 
+			unsigned char irDataBuf[],int irId ){
+	int k,jk;
+	unsigned char DataTemp[100];
+	char andyBuf[100];
+
+	int nameLen = strlen(nameBuf);
+	int irDataLen = strlen(irDataBuf);
+
+	DataTemp[0] = 19 + nameLen+irDataLen;
+	DataTemp[1] = 0;
+	DataTemp[2] = 0xFF;
+	DataTemp[3] = 0XFF;
+	DataTemp[4] = 0XFF;
+	DataTemp[5] = 0XFF;
+	DataTemp[6] = 0xFE;
+	DataTemp[7] = 0xA7;
+				
+	DataTemp[8] = 10+nameLen+irDataLen;
+				
+	DataTemp[9] = 0;//device address
+	DataTemp[10] = 0;
+	DataTemp[11] = 0;
+				
+	DataTemp[12] = 0x04;
+	DataTemp[13] = 2+nameLen+irDataLen; //liupeng 0527
+	DataTemp[14] =0;
+				
+	DataTemp[15] = irDataLen; //liupeng 0527
+	memcpy(&DataTemp[16],&irDataBuf[0],irDataLen);
+				
+	int index = 16+irDataLen;
+	DataTemp[index] = nameLen;
+	index++;
+	memcpy(&DataTemp[index],&nameBuf[0],nameLen);
+				
+	int index2 = index+nameLen;
+	DataTemp[index2] = irId%256;// IR ID
+	DataTemp[index2+1] = irId/256;
+				
+	pf(" SAVE IR DATA TO GATEWAY to zll");
+				
+
+	for(k=0;k<DataTemp[0];k++) //liupeng . 打印出报文
+	{
+		jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)DataTemp[k]);
+					
+	}
+	andyBuf[jk+1]='\0';
+	pf(andyBuf);
+	printf("\n");
+				
+				
+				
+	ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]); //发送给zll
+				
+	printf(",save ir data to gateway....\n");
+}
+
+/*
+预先存储一些透传命令到网关 0531 liupeng
+*/
+void saveIRToGateway(PT_TCPWROpr ptTmp,PT_NetDeviceOpr ptNetDeviceOpr)
+{
+	//机械手 开关停
+	unsigned char ir_handler_start[] ={0x88,0x99,0xaa,0x10,0x01};
+	unsigned char ir_handler_stop[] ={0x88,0x99,0xaa,0x10,0x00};
+	unsigned char ir_handler_pause[] ={0x88,0x99,0xaa,0x10,0x02};
+	//门锁 开关
+	unsigned char ir_lock_start[] ={0x88,0x99,0xaa,0x13,0x01};
+	unsigned char ir_lock_stop[] ={0x88,0x99,0xaa,0x13,0x00};
+	//喂鱼器 开关
+	unsigned char ir_fish_start[] ={0x88,0x99,0xaa,0x11,0x01};
+	unsigned char ir_fish_stop[] ={0x88,0x99,0xaa,0x11,0x00};
+	//void addIR(PT_TCPWROpr ptTmp,PT_NetDeviceOpr ptNetDeviceOpr,char nameBuf[], char irDataBuf[],int irId )
+	
+	addIR( ptTmp, ptNetDeviceOpr,"ir_name_handler_start",ir_handler_start,1);
+	usleep(30000);
+	addIR( ptTmp, ptNetDeviceOpr,"ir_name_handler_stop",ir_handler_stop,2);
+	usleep(30000);
+	addIR( ptTmp, ptNetDeviceOpr,"ir_name_handler_pause",ir_handler_pause,3);
+	usleep(30000);
+	addIR( ptTmp, ptNetDeviceOpr,"ir_name_lock_start",ir_lock_start,4);
+	usleep(30000);
+	addIR( ptTmp, ptNetDeviceOpr,"ir_name_lock_stop",ir_lock_stop,5);
+	usleep(30000);
+	addIR( ptTmp, ptNetDeviceOpr,"ir_name_fish_start",ir_fish_start,6);
+	usleep(30000);
+	addIR( ptTmp, ptNetDeviceOpr,"ir_name_fish_stop",ir_fish_stop,7);
+	usleep(30000);
+}
+/*
+在程序刚启动的时候 去执行，对zll里写入几条通用的红外透传命令
+*/
+void savdCommonIRCommand(void)
+{
+	unsigned char Temp[7];
+	int i;
+	unsigned char DataTemp[20];
+	//int iError;
+	//unsigned char sqltemp[15];
+	//unsigned char *sql = "%d.%d.%d.%d";
+	PT_pcTxTime PCTx;
+
+	PT_NetDeviceOpr ptNetDeviceOpr;
+	int len;
+	PT_TCPWROpr ptTmp;
+	PT_Sys_Para_Opr Para;
+
+
+	//PT_NetDeviceOpr server;
+	
+	Para = GetDefultSysParaOpr();
+
+	//server = GetNetDeviceOpr("tcp_client");
+			
+	ptNetDeviceOpr = GetNetDeviceOpr("zll");
+	
+	ptTmp = GetNetOpr("netdevice");
+
+	if(ptNetDeviceOpr)
+	{	
+		saveIRToGateway(ptTmp, ptNetDeviceOpr);
+	}
+		
+	
+	
+}
+
+
+
+
+/********************************************************************************** 
+ 函 数 名：CRC_Cal
+ 功    能：CRC校验,异或校验
+ 说    明：
+ 入口参数：CRC_buf:待校验的数据包;buf_len:数据长度DeviceSn
+ 返 回 值：校验结果
+**********************************************************************************/
+unsigned char CRC_Cal(unsigned char *CRC_Buf,int buf_len)
+{
+	int	i;
+	unsigned char dat = 0x00;
+	
+	for (i = 0; i < buf_len; i++)
+		dat	^= *CRC_Buf++;
+	
+	return dat;
+
+}
+
+unsigned char CRC_Cal_9(unsigned char *CRC_Buf,int buf_len)
+{
+	int	i;
+	unsigned char dat = 0x00;
+	
+	for (i = 0; i < buf_len; i++)
+	{
+		if(i!=9)
+		dat	^= *CRC_Buf++;
+		else
+		CRC_Buf++;
+	}
+	
+	return dat;
+
+}
+//发送数据
+int TcpSendData(int fd,unsigned char cmd,unsigned char *data,int len)
+{
+	PT_TCPWROpr ptTmp;
+	unsigned char *senddata=NULL;
+
+	senddata = malloc(8192);
+
+	if(senddata==NULL)
+	return -1;
+	
+	senddata[0] = HAEDDATA;
+	senddata[1] = HAEDDATA;
+	senddata[2] = HAEDDATA;
+	senddata[3] = 0xFF;
+	senddata[4] = 0xFF;
+	senddata[5] = 0xFF;
+	senddata[6] = 0xFF;
+	senddata[7] = cmd;
+	senddata[8] = 1;
+	//senddata[9] = crc;
+	senddata[10] = (len>>8)&0xff;
+	senddata[11] = len;
+	senddata[12] = 0xB5;
+
+	memcpy(&senddata[13],data,len);
+	
+	senddata[9] = CRC_Cal_9(senddata,len+13);
+	
+	if (SendData(fd,senddata,len+13)==0)
+	{
+		printf("send fd:%d!\n",fd);
+		free(senddata);
+		
+		return 0;
+	}
+	else
+	{
+		printf("send fail! fd:%d - CMD:%X\n",fd,cmd);
+		free(senddata);
+		
+		return -1;
+	}
+}
+
+
+/****************************************************************************/
+/* 函 数 名：	Read_Buffer													*/
+/* 功    能：	TCP通信缓存区读取											*/
+/* 说    明：	返回为单个字节,采用重复读取直到缓存区无数据					*/
+/* 入口参数：	无															*/
+/* 返 回 值：	r_data;														*/
+/****************************************************************************/
+int Read_Buffer(int fd)
+{
+	int r_data;
+	PT_NetMemOpr pt_NetMem;
+
+	pt_NetMem = GetNetMemData(fd);
+	
+	if(!pt_NetMem)
+	{
+		//printf("fd2%d\n",fd);
+		return -1;
+	}
+	//printf("pt_NetMem->HeadAddr%d,pt_NetMem->EndAddr%d\n",pt_NetMem->HeadAddr,pt_NetMem->EndAddr);
+	if(pt_NetMem->HeadAddr == pt_NetMem->EndAddr)
+	{
+		return -1;
+	}
+	
+	r_data = pt_NetMem->DataAddr[pt_NetMem->EndAddr];
+	
+	pt_NetMem->EndAddr ++;
+
+	if(pt_NetMem->EndAddr >= NETMEMSIZE)
+		pt_NetMem->EndAddr = 0;
+
+	return (unsigned char)r_data;      
+}
+//回调函数
+static int ReadDataRecord(void *pvParam,int nColumn,char **ColVal,char **ColName)
+{
+	int i;
+	PT_Selcet_Opr data;
+
+	data = (T_Selcet_Opr*)pvParam;
+	
+	
+	//printf("--------include Num:%d------------\n",nColumn);
+	//printf("ReadDataRecord the data success!\n");
+	if(ColVal[i]!=NULL)
+	{
+		data->ColName = (unsigned char **)malloc(sizeof(char **)*nColumn);
+		data->ColVal  = (unsigned char **)malloc(sizeof(char **)*nColumn);
+
+		for(i=0;i<nColumn;i++)
+		{
+			data->ColName[i] = (char *)malloc(strlen(ColName[i]));
+			data->ColVal[i]  = (char *)malloc(strlen(ColVal[i]));
+			
+			memcpy(data->ColName[i],ColName[i],strlen(ColName[i]));
+			memcpy(data->ColVal[i],ColVal[i],strlen(ColVal[i]));
+
+		}
+	}
+	else
+	{
+		data->ColVal = NULL;
+	}
+	data->colnum = nColumn;
+
+	return 0;
+}
+
+
+int ReadNetBuf(unsigned char *DataAddrs)
+{
+	int i;
+	PT_NetMemOpr ptTmp;
+	
+	int len=0;
+	ptTmp = GetNetMemDataFull();
+	
+	
+	if(ptTmp==NULL)
+	return -1;
+
+	while(1)
+	{
+		if(ptTmp->DataAddr[ptTmp->EndAddr]==HAEDDATA)				//判断帧头	
+		{
+			if(ptTmp->DataAddr[ptTmp->EndAddr+1]==HAEDDATA)			//判断帧头
+			{
+				if(ptTmp->DataAddr[ptTmp->EndAddr+2]==HAEDDATA)		//判断帧头	
+				{	
+					//if(ptTmp->DataLen>=(ptTmp->DataAddr[ptTmp->End+10]+12))
+					{	
+						len  = (ptTmp->DataAddr[ptTmp->EndAddr+10]<<8);
+						len  |= ptTmp->DataAddr[ptTmp->EndAddr+11];
+						
+						//printf("HeadAddr5:,%d\n",ptTmp->HeadAddr);
+						//printf("HeadAddr6:,%d\n",ptTmp->EndAddr);
+						//printf("addr1:%d\n",ptTmp);
+						if(ptTmp->DataAddr[ptTmp->EndAddr+9] == CRC_Cal_9(&ptTmp->DataAddr[ptTmp->EndAddr],len+13))
+						{
+							//DataAddrs = malloc(ptTmp->DataLen);
+							//printf("-------------3--------------\n");
+							memcpy(DataAddrs,&ptTmp->DataAddr[ptTmp->EndAddr],len+13);
+							
+							ptTmp->EndAddr += (len+13);
+
+							if(ptTmp->EndAddr >= (NETMEMSIZE))
+							{
+								ptTmp->EndAddr = 0;
+							}
+							
+							memset(&ptTmp->DataAddr[ptTmp->EndAddr-(len+13)],0,len+13);
+							//printf("HeadAddr7:,%d\n",ptTmp->HeadAddr);
+							//printf("HeadAddr8:,%d\n",ptTmp->EndAddr);
+							//printf("addr2:%d\n",ptTmp);
+							return ptTmp->ID;
+						}
+					}
+				}
+			}
+		}
+		
+		ptTmp->EndAddr++;
+		
+		if(ptTmp->EndAddr >= (NETMEMSIZE))
+			ptTmp->EndAddr = 0;
+
+		if(ptTmp->EndAddr==ptTmp->HeadAddr)
+		return -1;
+	}
+	return -1;
+	
+}
+	
+
+
+
+/****************************************************************************/
+/* 函 数 名：Rx_Tcp															*/
+/* 功    能：从电脑接收数据处理												*/
+/* 说    明：TCP通信处理													*/
+/* 入口参数：																*/
+/* 返 回 值：0：无数据 1：有数据  											*/
+/****************************************************************************/
+int Rx_Tcp(void *data,int fd)
+{
+	int rx_len,cal_crc,i;  							
+ 	int usart_rx;										//接受数据;
+
+ 	PT_TCP_Rx_Opr TCP_Rx_STR =(T_TCP_Rx_Opr *)data;
+	//printf("Rx_Tcp-fd:%d\n",fd);
+ 	if(GetDataNum(fd)==1)
+ 	{
+		usart_rx = Read_Buffer(fd);							//读取数据;
+		
+		if(usart_rx<0)										//判断缓存区是否有数据;
+			return -1;
+		//printf("333333\n");
+		//for(i=0;i<len;i++)
+		printf("%2X ",(unsigned char)usart_rx);
+	    
+		i = TCP_Rx_STR->Rx_Bot;						//长度标志;
+
+		TCP_Rx_STR->Rx_Data[i]=(unsigned char)usart_rx;				//数据放进数组缓存;
+		
+		switch(i)											
+		{
+			case 0:
+				TCP_Rx_STR->Rx_Len=0;					//初始化总长度;
+				TCP_Rx_STR->Rx_OK=0;
+
+				if(usart_rx==Pro_SOH||usart_rx==0x7E)		//判断协议头,备用协议头0x7E;
+				{
+					TCP_Rx_STR->Rx_Bot++; 
+					BK_Pro_SOH=usart_rx;					
+				}	  
+				break;
+
+			case 1:
+				if(usart_rx==BK_Pro_SOH)	
+				{
+					TCP_Rx_STR->Rx_Bot++;  
+				}
+				else
+				{
+					TCP_Rx_STR->Rx_Bot=0;
+				}	  
+				break;
+
+			case 2:
+				if(usart_rx==BK_Pro_SOH)		
+				{
+					TCP_Rx_STR->Rx_Bot++; 	
+				}
+				else
+				{
+					TCP_Rx_STR->Rx_Bot=0;	
+				}	  
+				break;
+
+			case 3:
+				TCP_Rx_STR->Rx_Bot++;
+				break;
+		   
+			default:
+			    if(TCP_Rx_STR->Rx_Data[4]+6>NETMEMSIZE)  // 
+				{
+					TCP_Rx_STR->Rx_Bot=0;
+					break;
+				}
+				
+			if(i<TCP_Rx_STR->Rx_Data[4]+5)          // 修改 2
+		    {
+		     	TCP_Rx_STR->Rx_Bot++;
+		    }
+		    else   //数据接收结束
+		    {
+		         rx_len=i+1;
+			     cal_crc=CRC_Cal(TCP_Rx_STR->Rx_Data,rx_len-1);
+		         if(cal_crc!=TCP_Rx_STR->Rx_Data[i])
+			     {
+					  TCP_Rx_STR->Rx_OK=0;
+				      TCP_Rx_STR->Rx_Bot=0;
+				 }
+			     else
+			     {
+					  TCP_Rx_STR->Rx_OK = RX_OK;
+					  TCP_Rx_STR->Rx_Len=rx_len;
+				      TCP_Rx_STR->Rx_Bot=0;
+				      return 0;
+			     }
+		    }
+		    break;
+		}   
+
+	}
+	return 1;
+} 
+
+
+/****************************************************************************/
+/* 函 数 名：Rx_TCP_PC														*/
+/* 功    能：TCP/IP接受数据处理												*/
+/* 说    明：无																*/
+/* 入口参数：																*/
+/* 返 回 值：0: 无数据返回,1:有数据返回 									*/
+/****************************************************************************/
+int Rx_TCP_PC(PT_TCP_Rx_Opr TCP_Rx_STR,int fd)
+{
+	TCP_Rx_STR->Rx_Bot = 0;
+	int i;
+	/*读接收缓存数据*/
+	for(i=0;i<5;i++)
+	{
+		usleep(10000);
+		
+		if(!Rx_Tcp(TCP_Rx_STR,fd))
+			break;
+	}
+	
+	if(TCP_Rx_STR->Rx_OK==RX_OK)
+	{
+
+		TCP_Rx_STR->Rx_OK=RX_OK_P;
+		TCP_Rx_STR->Device_Sn = TCP_Rx_STR->Rx_Data[3];
+		printf("rx_ok!\n");
+		return 0 ;
+	}
+	else 
+	{
+		//printf("2222222222\n");
+		TCP_Rx_STR->Device_Sn = -1;
+	}
+	
+	return -1;
+}
+
+
+void TcpSend(char *name,char *data,int len)
+{
+	PT_NetDeviceOpr ptNetDeviceOpr;
+
+	ptNetDeviceOpr = GetNetDeviceOpr(name);
+
+	SendData(ptNetDeviceOpr->fd,data,len);
+}
+
+void UdpTx(char *data,int len)
+{
+	UdpSend("udp_send",data,len);
+}
+
+
+int Can_Tcp_TX_To_PC(unsigned char cmd,unsigned char *data,int len)
+{
+	//TcpSend(char *name,char *data,int len);
+}
+
+int CpytoUser(PT_DevInfo_Opr DevInfo,PT_Selcet_Opr rpdata)
+{
+	DevInfo->Sn            	= atol(rpdata->ColVal[1]);			//唯一索引
+	DevInfo->ShortAddr  	= atol(rpdata->ColVal[2]);	//短地址
+	DevInfo->Endpoint		= atol(rpdata->ColVal[3]);	//通路地址
+	DevInfo->ProfileID		= atol(rpdata->ColVal[4]);	//Profileid
+	DevInfo->DeviceID		= atol(rpdata->ColVal[5]);	//设备ID
+	DevInfo->ZoneType 		= atol(rpdata->ColVal[6]);	//
+	DevInfo->DevState		= atol(rpdata->ColVal[7]);	//设备状态
+	DevInfo->OnlineState 	= atol(rpdata->ColVal[8]);	//在线状态
+	DevInfo->Val			= atol(rpdata->ColVal[9]);		//值
+	DevInfo->SnNo			= atol(rpdata->ColVal[10]);		//SN号
+	DevInfo->BDType1		= atol(rpdata->ColVal[11]);	//绑定类型1
+	DevInfo->BDTypeSn1  	= atol(rpdata->ColVal[12]);	//绑定类型索引1
+	DevInfo->BDType2		= atol(rpdata->ColVal[13]);	//绑定类型2
+	DevInfo->BDTypeSn2 		= atol(rpdata->ColVal[14]);	//绑定类型索引2
+
+	DevInfo->Rs1		= atol(rpdata->ColVal[15]); //绑定类型索引1
+	DevInfo->Rs2		= atol(rpdata->ColVal[16]); //绑定类型2
+	DevInfo->Rs3		= atol(rpdata->ColVal[17]); //绑定类型索引2
+	DevInfo->Rs4		= atol(rpdata->ColVal[18]); //绑定类型索引2
+	DevInfo->Rs5		= atol(rpdata->ColVal[19]); //绑定类型索引2
+	
+
+	DevInfo->Namelen  		= atol(rpdata->ColVal[20]);	//名字长度
+	memcpy(DevInfo->Name,rpdata->ColVal[21],DevInfo->Namelen);
+	DevInfo->Name[DevInfo->Namelen] = '\0';
+	DevInfo->pRs6		= NULL;
+	
+	return 0;
+}
+
+
+int CpytoGroup(PT_GroupInfo_Opr GroupInfo,PT_Selcet_Opr rpdata)
+{
+	GroupInfo->Nature	= atol(rpdata->ColVal[3]); //绑定类型索引1
+	GroupInfo->Uid		= atol(rpdata->ColVal[4]); //绑定类型2
+	GroupInfo->Rs1		= atol(rpdata->ColVal[5]); //绑定类型索引1
+	GroupInfo->Rs2		= atol(rpdata->ColVal[6]); //绑定类型2
+
+	GroupInfo->Namelen  		= atol(rpdata->ColVal[2]);	//名字长度
+	memcpy(GroupInfo->Name,rpdata->ColVal[1],GroupInfo->Namelen);
+	GroupInfo->Name[GroupInfo->Namelen] = '\0';
+	
+	return 0;
+}
+
+	
+int FindAllDev(int id,PT_DevInfo_Opr dev_info)
+{
+	PT_SqlStoreOpr Sqlctl;
+	
+	ReceParam rp ;
+	T_Selcet_Opr rpdata;
+	int i;
+
+	Sqlctl = GetDefultSqlOpr();
+
+	rpdata.colnum = 0;
+
+	rp.data = (void *)&rpdata;
+	rp.cb = ReadDataRecord;
+
+	Sqlctl->sql_Select_AllDev(db,DEV_INFO,id,(void *)&rp);
+
+	if(rpdata.colnum)
+	{
+		//dev_info = (PT_SqlStoreOpr)malloc(sizeof(dev_info));
+		CpytoUser(dev_info,&rpdata);
+	}
+	else
+	{
+		dev_info->Sn = -1;
+		return -1;
+	}
+
+	for(i=0;i<rpdata.colnum;i++)
+	{
+		free(rpdata.ColName[i]);
+		free(rpdata.ColVal[i]);  
+	}
+	
+	free(rpdata.ColName);
+	free(rpdata.ColVal);  
+
+	return 0;
+}
+
+int FindAllGroup(char *tablename,int id,PT_GroupInfo_Opr Group_info)
+{
+	PT_SqlStoreOpr Sqlctl;
+	
+	ReceParam rp ;
+	T_Selcet_Opr rpdata;
+	int i;
+
+	Sqlctl = GetDefultSqlOpr();
+
+	rpdata.colnum = 0;
+
+	rp.data = (void *)&rpdata;
+	rp.cb = ReadDataRecord;
+
+	Sqlctl->sql_Select_AllDev(db,tablename,id,(void *)&rp);
+
+	if(rpdata.colnum)
+	{
+		//dev_info = (PT_SqlStoreOpr)malloc(sizeof(dev_info));
+		CpytoGroup(Group_info,&rpdata);
+	}
+	else
+	{
+		Group_info->Rs1 = -1;
+		return -1;
+	}
+
+	for(i=0;i<rpdata.colnum;i++)
+	{
+		free(rpdata.ColName[i]);
+		free(rpdata.ColVal[i]);  
+	}
+	
+	free(rpdata.ColName);
+	free(rpdata.ColVal);  
+
+	return 0;
+}
+
+
+int FindDev(int ShortAddr,int Endpoint,PT_DevInfo_Opr dev_info)
+{
+	PT_SqlStoreOpr Sqlctl;
+	
+	ReceParam rp ;
+	T_Selcet_Opr rpdata;
+	int i;
+
+	Sqlctl = GetDefultSqlOpr();
+
+	rpdata.colnum = 0;
+
+	rp.data = (void *)&rpdata;
+	rp.cb = ReadDataRecord;
+
+	Sqlctl->sql_Select_Dev(db,DEV_INFO,ShortAddr,Endpoint,(void *)&rp);
+
+	if(rpdata.colnum)
+	{
+		//dev_info = (PT_SqlStoreOpr)malloc(sizeof(dev_info));
+		CpytoUser(dev_info,&rpdata);
+	}
+	else
+	{
+		dev_info->Sn = -1;
+		return -1;
+	}
+
+	for(i=0;i<rpdata.colnum;i++)
+	{
+		free(rpdata.ColName[i]);
+		free(rpdata.ColVal[i]);  
+	}
+	
+	free(rpdata.ColName);
+	free(rpdata.ColVal);  
+
+	return 0;
+}
+
+int FindGroup(char *name ,char *groupname,PT_GroupInfo_Opr group_info)
+{
+	PT_SqlStoreOpr Sqlctl;
+	
+	ReceParam rp ;
+	T_Selcet_Opr rpdata;
+	int i;
+
+	Sqlctl = GetDefultSqlOpr();
+
+	rpdata.colnum = 0;
+
+	rp.data = (void *)&rpdata;
+	rp.cb = ReadDataRecord;
+
+	Sqlctl->sql_Select_Group(db,name,groupname,(void *)&rp);
+
+	if(rpdata.colnum)
+	{
+		//dev_info = (PT_SqlStoreOpr)malloc(sizeof(dev_info));
+		CpytoGroup(group_info,&rpdata);
+	}
+	else
+	{
+		group_info->Rs1 = -1;
+		return -1;
+	}
+
+	for(i=0;i<rpdata.colnum;i++)
+	{
+		free(rpdata.ColName[i]);
+		free(rpdata.ColVal[i]);  
+	}
+	
+	free(rpdata.ColName);
+	free(rpdata.ColVal);  
+
+	return 0;
+}
+
+int FindGroupUid(char *name ,int uid,PT_GroupInfo_Opr group_info)
+{
+	PT_SqlStoreOpr Sqlctl;
+	
+	ReceParam rp ;
+	T_Selcet_Opr rpdata;
+	int i;
+
+	Sqlctl = GetDefultSqlOpr();
+
+	rpdata.colnum = 0;
+
+	rp.data = (void *)&rpdata;
+	rp.cb = ReadDataRecord;
+
+	Sqlctl->sql_Select_GroupUid(db,name,uid,(void *)&rp);
+
+	if(rpdata.colnum)
+	{
+		//dev_info = (PT_SqlStoreOpr)malloc(sizeof(dev_info));
+		CpytoGroup(group_info,&rpdata);
+	}
+	else
+	{
+		group_info->Rs1 = -1;
+		return -1;
+	}
+
+	for(i=0;i<rpdata.colnum;i++)
+	{
+		free(rpdata.ColName[i]);
+		free(rpdata.ColVal[i]);  
+	}
+	
+	free(rpdata.ColName);
+	free(rpdata.ColVal);  
+
+	return 0;
+}
+
+
+
+
+int FindDevNum(void)
+{
+	PT_SqlStoreOpr Sqlctl;
+	
+	ReceParam rp ;
+	T_Selcet_Opr rpdata;
+	int i,num;
+
+	Sqlctl = GetDefultSqlOpr();
+	
+	rpdata.colnum = 0;
+	
+
+	rp.data = (void *)&rpdata;
+	
+	rp.cb = ReadDataRecord;
+	
+
+	Sqlctl->sqlSelectMaxid(db,DEV_INFO,(void *)&rp);
+
+	
+	if(rpdata.ColVal!=NULL)
+	{
+		//dev_info = (PT_SqlStoreOpr)malloc(sizeof(dev_info));
+		//CpytoUser(dev_info,&rpdata);
+		num = atol(rpdata.ColVal[0]);			//唯一索引
+	}
+	else
+	{
+		//dev_info->Sn = -1;
+		return -1;
+	}
+
+	for(i=0;i<rpdata.colnum;i++)
+	{
+		free(rpdata.ColName[i]);
+		free(rpdata.ColVal[i]);  
+	}
+	
+	free(rpdata.ColName);
+	free(rpdata.ColVal);  
+
+	//printf("i:%d\n:",i);
+
+	return num;
+}
+
+
+int FindAllNumber(char *name)
+{
+	PT_SqlStoreOpr Sqlctl;
+	
+	ReceParam rp ;
+	T_Selcet_Opr rpdata;
+	int i,num;
+
+	Sqlctl = GetDefultSqlOpr();
+	
+	rpdata.colnum = 0;
+	
+
+	rp.data = (void *)&rpdata;
+	
+	rp.cb = ReadDataRecord;
+	
+	Sqlctl->sqlSelectMaxid(db,name,(void *)&rp);
+
+	
+	if(rpdata.ColVal!=NULL)
+	{
+		//dev_info = (PT_SqlStoreOpr)malloc(sizeof(dev_info));
+		//CpytoUser(dev_info,&rpdata);
+		num = atol(rpdata.ColVal[0]);			//唯一索引
+	}
+	else
+	{
+		//dev_info->Sn = -1;
+		return -1;
+	}
+
+	for(i=0;i<rpdata.colnum;i++)
+	{
+		free(rpdata.ColName[i]);
+		free(rpdata.ColVal[i]);  
+	}
+	
+	free(rpdata.ColName);
+	free(rpdata.ColVal);  
+
+	//printf("i:%d\n:",i);
+
+	return num;
+}
+
+
+
+unsigned char IDfeibitome(int devid,int zone)
+{
+	switch(devid)
+	{
+		case chuanlian: 			
+		{
+			return chuanlianX;
+		}
+		case OnOffOutput: 			
+		{
+			return OnOffOutputX;
+		}
+		case chazuo: 			
+		{
+			return chazuoX;
+		}
+		case riZF:
+		{
+			return riZFX;
+		}
+		case Wsd:
+		{
+			return WsdX;
+		}
+		case chuanganqi:
+		{
+			if(zone==rentiri)
+			{
+				return rentiriX;
+			}
+			else if(zone==yangan)
+			{
+				return yanganX;
+			}
+			else if(zone==menci)
+			{
+				return menciX;
+			}
+			else if(zone==ranqi)
+			{
+				return ranqiX;
+			}
+			else if(zone==jinjikey)
+			{
+				return jinjikeyX;
+			}
+			break;
+		}
+		case qingjingkg:
+		{
+			return qingjingkgX;
+		}
+		case on_off_light :  //0602
+		{
+			return on_off_lightX;
+		}
+		case dimmable_light : 
+		{
+			return dimmable_lightX;
+		}
+		case color_dimmable_light :
+		{
+			return color_dimmable_lightX;
+		}
+		case door_lock: //0611
+		{
+			return door_lockX;
+		}
+		default:
+		{
+			return 0xff;
+			
+		}
+	}
+}
+
+int IDmetofeibi(unsigned char devid)
+{
+	switch(devid)
+	{
+		case chuanlianX: 			
+		{
+			return chuanlian;
+		}
+		case OnOffOutputX: 			
+		{
+			return OnOffOutput;
+		}
+		case chazuoX: 			
+		{
+			return chazuo;
+		}
+		case rentiriX: 			
+		{
+			return chuanganqi;
+		}
+		case yanganX: 			
+		{
+			return chuanganqi;
+		}
+		case menciX: 			
+		{
+			return chuanganqi;
+		}
+		case ranqiX: 			
+		{
+			return chuanganqi;
+		}
+		case jinjikeyX: 			
+		{
+			return chuanganqi;
+		}
+		case riZFX:
+		{
+			return riZF;
+		}
+		case WsdX:
+		{
+			return Wsd;
+		}
+		case qingjingkgX:
+		{
+			return qingjingkg;
+		}
+		case touchuanX: //0527  透传设备
+		{
+			return touchuan;
+		}
+		case on_off_lightX :  //0602
+		{
+			return on_off_light;
+		}
+		case dimmable_lightX : 
+		{
+			return dimmable_light;
+		}
+		case color_dimmable_lightX :
+		{
+			return color_dimmable_light;
+		}
+		case door_lockX: //0611
+		{
+			return door_lock;
+		}
+		
+		default:
+		{
+			
+			break;
+		}
+	}
+}
+
+
+void RX_PC_Info_Process(PT_TCP_Rx_Opr TCP_Rx_STR)
+{
+	int i,devnumber,groupnum;
+	int jk;
+	
+	PT_Sys_Para_Opr Para;
+	PT_pcTxTime PCTx;
+	int fd,Dlen,page;
+	int DataLen=0;
+
+	PT_TCPWROpr ptTmp;
+	PT_NetMemOpr pttcp;
+	PT_NetDeviceOpr ptNetDeviceOpr;
+	PT_NetDeviceOpr ptserverOpr;
+	
+	unsigned char sqltemp[20];
+	unsigned char *sql = "%d.%d.%d.%d";
+	unsigned char *NetData;
+	unsigned char DataTemp[4096];
+	unsigned char strtmp[100];
+	unsigned char strnametmp[100];
+	int DeviceSn;
+	int DeviceNum=0;
+	int Dport;
+	int k;
+	static int Address=0,AddressBK=0;
+	static FILE *upfd;
+	unsigned char *UpData;
+	char andyBuf[1024];
+	char timeBuf[50]; //存放系统时间
+	char cmdBuf[50]; //date 命令
+	
+	PT_SqlStoreOpr Sqlctl;
+	T_DevInfo_Opr Devinfo,tDevinfo;
+	T_GroupInfo_Opr Groupinfo,tGroupinfo;
+	PT_DevInfo_Opr ptDevinfo;
+	ReceParam rp ;
+	T_Selcet_Opr rpdata;
+	
+	Sqlctl = GetDefultSqlOpr();
+
+	PCTx = GetPcTxTime();
+	ptNetDeviceOpr = GetNetDeviceOpr("zll");		//获取无线zigbee操作结构
+
+	ptserverOpr = GetNetDeviceOpr("tcp_client");	//获取无线服务器操作结构
+	Para = GetDefultSysParaOpr();					//获取系统参数；
+
+	fd = ReadNetBuf(TCP_Rx_STR->Rx_Data);		//读取手机以及服务器发过来的数据缓存；
+
+	NetData = TCP_Rx_STR->Rx_Data;				//赋给另外的指针；
+		
+	DeviceSn = NetData[3]<<24;
+	DeviceSn |= NetData[4]<<16;
+	DeviceSn |= NetData[5]<<8;
+	DeviceSn |= NetData[6];
+	
+	DataLen  = (NetData[10]<<8);
+	DataLen  |= NetData[11];				//合成长度
+
+	/*
+	if(fd>0)
+	{
+		for(i=0;i<DataLen+13;i++)
+		printf("%2X ",(unsigned char)*(NetData+i));
+	}*/
+	//printf("\nDeviceSn:%x\n",DeviceSn);
+
+	ptTmp = GetNetOpr("netdevice");			//获取网络操作结构；
+
+	//printf("ptNetDeviceOpr->fd:%d,fd:%d\n",ptNetDeviceOpr->fd,fd);
+	//判断数据是否获取到；
+	if((DeviceSn!=0)&&(fd != -1))
+	{
+		//for(i=0;i<DataLen+13;i++)
+		//printf("%2X ",(unsigned char)*(NetData+i));
+	
+		printf("\nCMD:%X\n",(unsigned char)NetData[7]);
+	
+		ptTmp = GetNetOpr("netdevice");
+	
+		//printf("ptNetDeviceOpr->fd:%d,fd:%d",ptNetDeviceOpr->fd,fd);
+
+		if ((ptTmp==NULL)||(ptNetDeviceOpr==NULL))
+		{
+			return ;
+		}
+
+		for(i=0;i<NetMenNum;i++)
+		{
+			if(Devclient[i].fd ==fd)
+			{
+				Devclient[i].cmd = NetData[7];
+				Devclient[i].answer= 1;
+				break;
+			}
+			
+		}
+		if(i==NetMenNum)
+		{
+			printf("fd:%d no save!\n",fd);
+			for(i=0;i<NetMenNum;i++)
+			{
+				if(Devclient[i].fd==0)
+				{
+					Devclient[i].fd = fd;
+					
+					Devclient[i].cmd = NetData[7];
+					Devclient[i].answer= 1;
+					break;
+				}
+			}
+		}
+		//根据获取到的数据跳转到具体的命令执行位置；
+		switch(NetData[7])
+		{
+			case FINDGAWY: 			/*发现网关1*/
+			{
+				DataTemp[0] = HAEDDATA;
+				DataTemp[1] = HAEDDATA;
+				DataTemp[2] = HAEDDATA;
+				DataTemp[3] = Para->DeviceSn[0];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[2];
+				DataTemp[6] = Para->DeviceSn[3];
+				DataTemp[7] = FINDGAWY;
+				DataTemp[8] = 1;
+				
+				DataTemp[10] = 0;
+				DataTemp[11] = 11+Para->Device_NameLen;
+				DataTemp[12] = 0xB5;
+				DataTemp[13] = Para->IP_Addr[0];
+				DataTemp[14] = Para->IP_Addr[1];
+				DataTemp[15] = Para->IP_Addr[2];
+				DataTemp[16] = Para->IP_Addr[3];
+				DataTemp[17] = 0x3A;
+				DataTemp[18] = 0x9B;
+				DataTemp[19] = Para->GatewaySn>>24;
+				DataTemp[20] = Para->GatewaySn>>16;
+				DataTemp[21] = Para->GatewaySn>>8;
+				DataTemp[22] = Para->GatewaySn;
+				DataTemp[23] = Para->Device_NameLen;
+				
+				sprintf(sqltemp,sql,NetData[3],NetData[4],NetData[5],NetData[6]);
+				printf("sqltemp:%s\n",sqltemp);
+				for(i=0;i<Para->Device_NameLen;i++)
+				{
+					DataTemp[24+i] = Para->DeviceName[i];
+				}
+
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devudp[i].fd == fd)
+					{
+						//Devudp[i].fd = rp->fd;
+						//Devudp[i].Port = ((SA *)(rp->data))->sa_data[1];
+						//Devudp[i].Port = ((SA *)(rp->data))->sa_data[0]<<8;
+						Dport = Devudp[i].Port;
+						//printf("Devudp[i].Port:%d\n",Devudp[i].Port);
+						//Devudp[i].answer = 0;
+						//Devudp[i].cmd = 0;
+						break;
+					}
+				}
+				//liupeng 0531 除了比较字符是否相同，还要比较长度 
+				int pwdLen = Para->Passwordlen;
+				
+				jk=sprintf(andyBuf,"datalen=%d,pwdLen=%d",DataLen,pwdLen);
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+				
+				memcpy(&andyBuf[0],&NetData[13],DataLen);
+				andyBuf[DataLen+1]='\0';
+				pf("input pwd:");
+				pf(andyBuf);
+				pf("gateway pwd:");
+				pf(Para->Password);
+				
+				if(DataLen != pwdLen)
+				{
+					DataTemp[17] = 0xFF;
+					DataTemp[18] = 0xFF;
+					DataTemp[9] = CRC_Cal_9(DataTemp,24+Para->Device_NameLen);
+					UdpSendWay(sqltemp,Dport,DataTemp,24+Para->Device_NameLen);
+					//SendData(fd,DataTemp,24+Para->Device_NameLen);
+
+					printf("get gawy password error!\n");
+					return;
+				}
+				//
+				for(i=0;i<DataLen;i++)
+				{
+					if(Para->Password[i]!=NetData[13+i])
+					{
+						DataTemp[17] = 0xFF;
+						DataTemp[18] = 0xFF;
+						DataTemp[9] = CRC_Cal_9(DataTemp,24+Para->Device_NameLen);
+						UdpSendWay(sqltemp,Dport,DataTemp,24+Para->Device_NameLen);
+						//SendData(fd,DataTemp,24+Para->Device_NameLen);
+
+						printf("get gawy password error!\n");
+						return ;
+					}
+				}
+
+				//system("ifconfig eth0 netmask 255.0.0.0");
+
+				DataTemp[9] = CRC_Cal_9(DataTemp,24+Para->Device_NameLen);
+				
+				UdpSendWay(sqltemp,Dport,DataTemp,24+Para->Device_NameLen);
+				printf("get gawy ok!\n");
+				
+				break;
+			}
+			case 0x1A:							//UDP修改设备IP地址；
+			{
+				if((NetData[17]==Para->IP_Addr[0])&&(NetData[18]==Para->IP_Addr[1])\
+					&&(NetData[19]==Para->IP_Addr[2])&&(NetData[20]==Para->IP_Addr[3]))
+				{
+					Para->IP_Addr[0] = NetData[13];
+					Para->IP_Addr[1] = NetData[14];
+					Para->IP_Addr[2] = NetData[15];
+					Para->IP_Addr[3] = NetData[16];
+					SetSysPara(Para);
+
+					for(i=0;i<NetMenNum;i++)
+					{
+						if(Devudp[i].fd == fd)
+						{
+							//Devudp[i].fd = rp->fd;
+							//Devudp[i].Port = ((SA *)(rp->data))->sa_data[1];
+							//Devudp[i].Port = ((SA *)(rp->data))->sa_data[0]<<8;
+							Dport = Devudp[i].Port;
+							//printf("Devudp[i].Port:%d\n",Devudp[i].Port);
+							//Devudp[i].answer = 0;
+							//Devudp[i].cmd = 0;
+							break;
+						}
+					}
+					
+
+					sprintf(sqltemp,sql,NetData[3],NetData[4],NetData[5],NetData[6]);
+					printf("sqltemp:%s\n",sqltemp);
+
+					//system("ifconfig eth0 netmask 255.0.0.0");
+					
+					DataTemp[0] = 'O';
+					UdpSendWay(sqltemp,Dport,DataTemp,1);
+					sleep(1);
+					system("reboot");
+				}
+				
+				
+				break;
+			}
+			case GETALLDEVICELIST: 			//获取全部设备列表2
+			{/*
+				DataTemp[0] = 0x08;  		//08 00 FF FF FF FF FE 81 
+				DataTemp[1] = 0;
+				DataTemp[2] = 0xFF;
+				DataTemp[3] = 0xFF;
+				DataTemp[4] = 0xFF;
+				DataTemp[5] = 0xFF;
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x81;
+				printf("GETALLDEVICELIST\n");
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,8);
+*/				//printf("get all device!\n");
+				DeviceNum = FindDevNum();
+				//sleep(1);
+				//printf("get all device1!DeviceNum:%d\n",DeviceNum);
+				//usleep(100000);
+				DataTemp[0] = DeviceNum;		//设备数量
+				i = 0;
+				if(DeviceNum>0)
+				{
+					printf("get all device: %d!\n",DeviceNum);
+					devnumber = 0;
+					for(i=0;i<DeviceNum;i++)
+					{//printf("get all device2!\n");
+					//sleep(1);
+						
+						FindAllDev(i+1,&tDevinfo);
+
+						if(tDevinfo.Sn>0)
+						{
+							DataTemp[1+(devnumber*35)] = 0xB6;
+							DataTemp[2+(devnumber*35)] = 33;
+							DataTemp[3+(devnumber*35)] = tDevinfo.ShortAddr>>8; 	//短地址
+							DataTemp[4+(devnumber*35)] = tDevinfo.ShortAddr;		//短地址
+							DataTemp[5+(devnumber*35)] = tDevinfo.Endpoint; 		//从地址
+							
+							DataTemp[6+(devnumber*35)] = IDfeibitome(tDevinfo.DeviceID,tDevinfo.ZoneType);		//设备ID
+							printf("get device,addr=%2x %2x,type=%2x\n",
+							DataTemp[3+(devnumber*35)],DataTemp[4+(devnumber*35)],DataTemp[6+(devnumber*35)]);
+							DataTemp[7+(devnumber*35)] = tDevinfo.BDType1; 	
+							DataTemp[8+(devnumber*35)] = tDevinfo.BDTypeSn1>>8; 
+							DataTemp[9+(devnumber*35)] = tDevinfo.BDTypeSn1; 
+							DataTemp[10+(devnumber*35)] = tDevinfo.BDType2; 	
+							DataTemp[11+(devnumber*35)] = tDevinfo.BDTypeSn2>>8; 	
+							DataTemp[12+(devnumber*35)] = tDevinfo.BDTypeSn2; 	
+							DataTemp[13+(devnumber*35)] = tDevinfo.Rs3; 
+
+							if(tDevinfo.OnlineState>0)
+								DataTemp[14+(devnumber*35)] = tDevinfo.DevState; 
+							else
+								DataTemp[14+(devnumber*35)] = 0xff; 
+							
+							DataTemp[15+(devnumber*35)] = tDevinfo.Namelen; 	//名称长度
+							//if(tDevinfo.Namelen)
+							memcpy(&DataTemp[16+(devnumber*35)],tDevinfo.Name,20);
+
+							devnumber++;
+							 
+						}
+
+					}
+				}
+				else
+				{	
+					DataTemp[0] = 0;
+					devnumber = 0;
+					/* liupeng mark 0522
+					DataTemp[1] = 0xB6;
+					DataTemp[2+(i*35)] = 33;
+					DataTemp[3+(i*35)] = 0; 	//短地址
+					DataTemp[4+(i*35)] = 0;		//短地址
+					DataTemp[5+(i*35)] = 0; 		//从地址
+					*/
+				}
+				printf("device number:%d!\n",i);
+				printf("device number:%d!\n",devnumber);
+				TcpSendData(fd,GETALLDEVICELIST,DataTemp,35*devnumber+1);
+				pf(DataTemp);
+				printf("GETALLDEVICELIST\n");
+				break;
+			}
+			case GETGROUPLIST: 			//获取分组列表3
+			{
+				//0x08 0x00 0x78 0x56 0x34 0x12 0xFE 0x8E
+				/*
+				DataTemp[0] = 0x08;  		//08 00 FF FF FF FF FE 81 
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x8E;
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,8);
+				*/
+				DataTemp[0] = DeviceNum = FindAllNumber(GROUP_INFO);
+				i = 0;
+				groupnum = 0;
+				if(DeviceNum>0)
+				{
+					groupnum = 0;
+					for(i=0;i<DeviceNum;i++)
+					{
+						FindAllGroup(GROUP_INFO,1+i,&tGroupinfo);
+
+						if(tGroupinfo.Rs1>0)
+						{
+							DataTemp[1+groupnum*24] = tGroupinfo.Uid >>8 ;
+							DataTemp[2+groupnum*24] = tGroupinfo.Uid ;
+							DataTemp[3+groupnum*24] = tGroupinfo.Nature;
+							DataTemp[4+groupnum*24] = tGroupinfo.Namelen;
+
+							memcpy(&DataTemp[5+groupnum*24],tGroupinfo.Name,20);
+							groupnum++;
+						}
+						
+					}
+				}
+				else
+				{
+				DataTemp[0] = 0;
+				groupnum = 0;
+				}
+				printf("group number:%d,!\n",groupnum);
+				DataTemp[0] = groupnum;
+				TcpSendData(fd,GETGROUPLIST,DataTemp,24*groupnum+1);
+				
+				printf("GETGROUPLIST\n");
+
+				break;
+			}
+			case GETGROUPDEVICELIST: 			//获取分组设备 
+			{
+				//0x0B 0x00 0x78 0x56 0x34 0x12 0xFE 0x98 0x02 0x34 0x12
+				DataTemp[0] = 0x0B;  		//08 00 FF FF FF FF FE 81 
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x98;
+				DataTemp[8] = 02;
+				DataTemp[9] = NetData[14];
+				DataTemp[10] = NetData[13];
+
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,11);
+				
+				printf("GETGROUPDEVICELIST\n");
+
+				break;
+			}
+			case ADDDEVICETOGROUP: 			//增加设备到组 15 
+			{
+				DataTemp[0] = 22+NetData[16];  		//1B 00 FF FF FF FF FE 8F 12 02 xx xx 00 00 00 00 00 00 endpoint 00 00 gnamelen name 
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x8F;
+				DataTemp[8] = 13+NetData[16];  		
+				DataTemp[9] = 0x02;
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = 0x0;
+				DataTemp[13] = 0x0;
+				DataTemp[14] = 0x0;
+				DataTemp[15] = 0x0;
+				DataTemp[16] = 0x0;  		
+				DataTemp[17] = 0x0;
+				DataTemp[18] = NetData[15];
+				DataTemp[19] = 0x00;
+				DataTemp[20] = 0x00;
+				DataTemp[21] = NetData[16];
+				
+				memcpy(&DataTemp[22],&NetData[17],NetData[16]);
+				memset(strtmp,0,100);
+				memcpy(strtmp,&NetData[17],NetData[16]);
+				strtmp[NetData[16]] = '\0';
+				
+				memcpy(tGroupinfo.Name,strtmp,NetData[16]+1);
+				tGroupinfo.Namelen = NetData[16];
+				tGroupinfo.Nature = NetData[17+NetData[16]];
+
+				printf("---------2----------Namelen:%d,Nature:%d,len:%d\n",tGroupinfo.Namelen ,tGroupinfo.Nature,NetData[16]);
+				
+				tGroupinfo.pRs3 = "ABC";
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,22+NetData[16]);
+				
+				/*add group to database*/
+				FindGroup(GROUP_INFO,strtmp,&Groupinfo);
+				
+				if(Groupinfo.Rs1>0)
+				{
+					printf("----3----Nature:%s\n",strtmp);
+					Groupinfo.Nature = NetData[17+NetData[16]];
+					Sqlctl->sql_update_Grouptable(db,GROUP_INFO,strtmp,&Groupinfo);
+				}
+				else
+				{
+					tGroupinfo.Rs1 = 1;
+					printf("----1----Nature:%s\n",strtmp);
+					Sqlctl->sql_insert_Groupinfo(db,GROUP_INFO,&tGroupinfo);
+				}
+				
+				printf("ADDDEVICETOGROUP\n");
+				break;
+			}
+			case DELETEDEVICEGROUP:		//0xD8		//删除设备到组: 16	
+			{
+				DataTemp[0] = 22+NetData[16];  		//1B 00 FF FF FF FF FE 8F 12 02 xx xx 00 00 00 00 00 00 endpoint 00 00 gnamelen name 
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x97;
+				DataTemp[8] = 13+NetData[16];  		
+				DataTemp[9] = 0x02;
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = 0x0;
+				DataTemp[13] = 0x0;
+				DataTemp[14] = 0x0;
+				DataTemp[15] = 0x0;
+				DataTemp[16] = 0x0;  		
+				DataTemp[17] = 0x0;
+				DataTemp[18] = NetData[15];
+				DataTemp[19] = 0x00;
+				DataTemp[20] = 0x00;
+				DataTemp[21] = NetData[16];
+				memcpy(&DataTemp[22],&NetData[17],NetData[16]);
+				memcpy(strtmp,&NetData[17],NetData[16]);
+				strtmp[NetData[16]] = '\0';
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,22+NetData[16]);
+				
+				if((NetData[13]==0xff) && (NetData[14]==0xff))
+				{
+					Sqlctl->sql_delete_Group(db,GROUP_INFO,strtmp);
+
+					for(i=0;i<NetMenNum;i++)
+					{
+						if(Devclient[i].fd >0)
+						{
+							TcpSendData(Devclient[i].fd,DELETEDEVICEGROUP,&NetData[13],4+NetData[16]);
+							usleep(10000);
+						}
+					}
+
+				
+				}
+				printf("DELETEDEVICEGROUP\n");
+				break;
+			}
+			case DELETEGROUP	:			///0xD9		//删除组: 			
+			{
+				
+				break;
+			}
+			case ADDGROUP:				//0XDA		//增加组: 			
+			{
+				
+				break;
+			}
+			case GETCHANGJINGLIST: 			//获取场景列表4
+			{
+				//0x08 0x00 0x78 0x56 0x34 0x12 0xFE 0x90
+				/*
+				DataTemp[0] = 0x08; 		
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x90;
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,8);
+				*/
+
+				DataTemp[0] = DeviceNum = FindAllNumber(SCENE_INFO);
+				i = 0;
+				groupnum = 0;
+				if(DeviceNum>0)
+				{
+					groupnum = 0;
+					for(i=0;i<DeviceNum;i++)
+					{
+						FindAllGroup(SCENE_INFO,1+i,&tGroupinfo);
+
+						if(tGroupinfo.Rs1>0)
+						{
+							DataTemp[1+groupnum*24] = tGroupinfo.Uid >>8 ;
+							DataTemp[2+groupnum*24] = tGroupinfo.Uid ;
+							DataTemp[3+groupnum*24] = tGroupinfo.Nature;
+							DataTemp[4+groupnum*24] = tGroupinfo.Namelen;
+
+							memcpy(&DataTemp[5+groupnum*24],tGroupinfo.Name,20);
+							groupnum++;
+						}
+						
+					}
+				}
+				else
+				{
+				DataTemp[0] = 0;
+				groupnum = 0;
+				}
+				printf("scene number:%d!\n",groupnum);
+				DataTemp[0] = groupnum;
+				TcpSendData(fd,GETCHANGJINGLIST,DataTemp,24*groupnum+1);
+				
+				
+				printf("GET CHANGJING LIST\n");
+				
+				
+				break;
+			}
+
+			case GETONECJLIST: 			//获取场景设备列表5
+			{
+				//0x11 0x00 0x78 0x56 0x34 0x12 0xFE
+				DataTemp[0] = 12+NetData[15]; 		
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x8A;
+				DataTemp[8] = NetData[15]+3;
+				DataTemp[9] = NetData[14];
+				DataTemp[10] = NetData[13];
+				DataTemp[11] = NetData[15];
+
+				memcpy(&DataTemp[12],&NetData[16],NetData[15]);
+				
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,17);
+				
+				printf("GET 1pcs CJ LIST LIST\n");
+				break;
+			}
+			case ADDCJ	:				//0XDB		//增加场景 19 
+			{
+				for(i=0;i<NetData[13];i++)
+				{//liupeng 8->10 每一个设备包含红外ID 和延时，如果该设备是透传设备，则红外ID 有意义
+					DataTemp[0] = 30+NetData[14+10*NetData[13]];  				//1B 00 FF FF FF FF FE 8F 12 02 xx xx 00 00 00 00 00 00 endpoint 00 00 gnamelen name 
+
+					DataTemp[1] = 0x00;
+					DataTemp[2] = Para->DeviceSn[3];
+					DataTemp[3] = Para->DeviceSn[2];
+					DataTemp[4] = Para->DeviceSn[1];
+					DataTemp[5] = Para->DeviceSn[0];
+					DataTemp[6] = 0xFE;
+					DataTemp[7] = 0x91;
+					DataTemp[8] = 21+NetData[14+10*NetData[13]];
+					DataTemp[9] = 0x02;
+					
+					DataTemp[10] = NetData[15+10*i];
+					DataTemp[11] = NetData[14+10*i];
+					DataTemp[12] = 0;
+					DataTemp[13] = 0;
+					DataTemp[14] = 0;
+					DataTemp[15] = 0;
+					DataTemp[16] = 0;  		
+					DataTemp[17] = 0;
+					DataTemp[18] = NetData[16+10*i];
+					DataTemp[19] = 0;
+					DataTemp[20] = 0;
+					DataTemp[21] = 0xff&IDmetofeibi(NetData[17+10*i]);		//id
+					DataTemp[22] = ((IDmetofeibi(NetData[17+10*i]))>>8);//id
+					DataTemp[23] = NetData[18+10*i];		//data1
+					DataTemp[24] = NetData[19+10*i];  		
+					DataTemp[25] = NetData[20+10*i];
+					DataTemp[26] = NetData[21+10*i];
+
+					
+					DataTemp[27] = NetData[14+10*NetData[13]];
+					
+					memcpy(&DataTemp[28],&NetData[15+10*NetData[13]],NetData[14+10*NetData[13]]);
+
+					DataTemp[28+DataTemp[27]] =  NetData[22+10*i];
+					DataTemp[29+DataTemp[27]] =  NetData[23+10*i];
+
+					ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,30+DataTemp[27]);
+					usleep(20000); //20毫秒
+					}
+					
+					
+					printf("\n5\n");
+					memset(strtmp,0,100);
+					memcpy(strtmp,&NetData[15+10*NetData[13]],NetData[14+10*NetData[13]]);
+					strtmp[NetData[14+10*NetData[13]]] = '\0';
+					printf("4\n");
+					memcpy(tGroupinfo.Name,strtmp,NetData[14+10*NetData[13]]+1);
+					tGroupinfo.Namelen = NetData[14+10*NetData[13]];
+					tGroupinfo.Nature = NetData[15+NetData[14+10*NetData[13]]+10*NetData[13]];
+					
+					printf("Nature:%d\n",tGroupinfo.Nature);
+					
+					/*add sence to database*/
+					FindGroup(SCENE_INFO,strtmp,&Groupinfo);
+					printf("1\n");
+					if(Groupinfo.Rs1>0)
+					{printf("2\n");
+						Groupinfo.Nature = NetData[15+NetData[14+10*NetData[13]]+10*NetData[13]];
+						Sqlctl->sql_update_Grouptable(db,SCENE_INFO,strtmp,&Groupinfo);
+					}
+					else
+					{printf("3\n");
+						tGroupinfo.Rs1 = 1;
+						tGroupinfo.pRs3 = "ABC";
+						Sqlctl->sql_insert_Groupinfo(db,SCENE_INFO,&tGroupinfo);
+						printf("3\n");
+					}
+
+					
+				
+				//存取场景类型  liupeng 0702
+				
+				jk = 15+10*NetData[13]+NetData[14+10*NetData[13]];
+
+
+				
+
+				
+				//场景类型为 NetData[jk]
+				//存储  场景名称和 场景类型 键值对保存
+				printf("ADDCJ\n");
+				break;
+			}
+			case MODIFYCJ:				//0XDC		//修改场景: 			
+			{
+				
+				break;
+			}
+			case RUNCJ	:				//0XCC		//运行场景 29
+			{
+				//0x0B 0x00 0x78 0x5 0x34 0x12 0xFE 0x92 0x02 0x34 0x12
+				DataTemp[0] = 0x0B; 		
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x92;
+				DataTemp[8] = 2;
+				DataTemp[9] = NetData[14];
+				DataTemp[10] = NetData[13];
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,11);
+				
+				printf("RUNCJ\n");
+				break;
+			}
+			case DELETECJ:				//0XDE		//删除场景或删除场景设备 22
+			{
+				DataTemp[0] = 22+NetData[16];  				//1B 00 FF FF FF FF FE 8F 12 02 xx xx 00 00 00 00 00 00 endpoint 00 00 gnamelen name 
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x8B;
+				DataTemp[8] = 14+NetData[16];
+				DataTemp[9] = 0x02;
+				
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = 0;
+				DataTemp[13] = 0;
+				DataTemp[14] = 0;
+				DataTemp[15] = 0;
+				DataTemp[16] = 0;  		
+				DataTemp[17] = 0;
+				DataTemp[18] = NetData[15];
+				DataTemp[19] = 0;
+				DataTemp[20] = 0;
+				
+				DataTemp[21] = NetData[16];
+				
+				memcpy(&DataTemp[22],&NetData[17],NetData[16]);
+
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,22+DataTemp[21]);
+
+				memcpy(strtmp,&NetData[17],NetData[16]);
+				strtmp[NetData[16]] = '\0';
+				
+				if((NetData[13]==0xff) && (NetData[14]==0xff))
+				{
+					Sqlctl->sql_delete_Group(db,SCENE_INFO,strtmp);
+
+					for(i=0;i<NetMenNum;i++)
+					{
+						if(Devclient[i].fd >0)
+						{
+							TcpSendData(Devclient[i].fd,DELETECJ,&NetData[13],4+NetData[16]);
+							usleep(10000);
+						}
+					}
+
+				
+				}
+
+				
+
+				printf("DELETECJ\n");
+				break;
+			}
+			case MODIFYCJNAME:			//0XCE		//修改场景名字 24
+			{
+				/*0x11 0x00 0x78 0x56 0x34 0x12 0xFE
+				数据总长 假定 SN 号为 0x12345678 控制标志
+				0x8C 0x08 0x34 0x12 0x05 0x73 0x63 0x65 0x6e 0x65
+				*/
+				DataTemp[0] = 12+NetData[15];  				
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x8C;
+				DataTemp[8] = 4+NetData[15];
+
+				DataTemp[9] = NetData[14];
+				DataTemp[10] = NetData[13];
+				
+				DataTemp[11] = NetData[15];
+				
+				memcpy(&DataTemp[12],&NetData[16],NetData[15]);
+
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,12+NetData[15]);
+
+
+				memcpy(strtmp,&NetData[16],NetData[15]);
+				strtmp[NetData[15]] = '\0';
+				
+				FindGroupUid(SCENE_INFO,(NetData[13]<<8)+NetData[14],&tGroupinfo);
+				printf("id:%d,id1:%d",NetData[13],NetData[14]);
+				if(tGroupinfo.Rs1>0)
+				{
+					memcpy(strnametmp,tGroupinfo.Name,tGroupinfo.Namelen);	//copy now val
+					strnametmp[tGroupinfo.Namelen] = '\0';
+					printf("namelen:%d",NetData[15]);
+					printf("name:%s",strnametmp);
+					tGroupinfo.Namelen = NetData[15];
+					memcpy(tGroupinfo.Name,strtmp,NetData[15]+1);
+					
+					Sqlctl->sql_update_Grouptable(db,SCENE_INFO,strnametmp,&tGroupinfo);
+					
+				}
+				else
+				{
+					//Sqlctl->sql_insert_Groupinfo(db,GROUP_INFO,tGroupinfo);
+				}
+
+				
+				printf("MODIFYCJNAME\n");
+				break;
+			}
+			case CTRLSWITCH: 			//控制设备开关状态6
+			{
+				
+				 				//1B 00 FF FF FF FF FE 8F 12 02 xx xx 00 00 00 00 00 00 endpoint 00 00 gnamelen name 
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x82;
+				
+				DataTemp[9] = 0x02;
+				
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = 0;
+				DataTemp[13] = 0;
+				DataTemp[14] = 0;
+				DataTemp[15] = 0;
+				DataTemp[16] = 0;  		
+				DataTemp[17] = 0;
+				DataTemp[18] = NetData[15];
+				DataTemp[19] = 0;
+				DataTemp[20] = 0;
+				
+				DataTemp[21] = NetData[16];
+				
+				if((NetData[17]==0xFF)&&(NetData[18]==0xFF))
+				{
+					DataTemp[8] = 0x0D;
+					DataTemp[0] = 0x16; 
+					ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x16);
+					printf("CTRLSWITCH:%d\n",ptNetDeviceOpr->fd);
+				}
+				else
+				{
+					DataTemp[8] = 0x0F;
+					DataTemp[22] = NetData[17];
+					DataTemp[23] = NetData[18];
+					DataTemp[0] = 0x18; 
+					ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x18);
+					printf("CTRLSWITCH:%d\n",ptNetDeviceOpr->fd);
+				}
+				
+				printf("CTRLSWITCH:%x%x%x%x\n",Para->DeviceSn[0],Para->DeviceSn[1],Para->DeviceSn[2],Para->DeviceSn[3]);
+				
+				
+				break;
+			}
+			
+			case SETLIGHTLEVEL: //设置灯的亮度
+			{
+				DataTemp[0] = 0x18;
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x83;
+				DataTemp[8] = 0x0F;
+				DataTemp[9] = 0x02;
+				
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = 0;
+				DataTemp[13] = 0;
+				DataTemp[14] = 0;
+				DataTemp[15] = 0;
+				DataTemp[16] = 0;  		
+				DataTemp[17] = 0;
+				DataTemp[18] = NetData[15];
+				DataTemp[19] = 0;
+				DataTemp[20] = 0;
+				
+				DataTemp[21] = NetData[16];
+				DataTemp[22] = NetData[18];
+				DataTemp[23] = NetData[17];
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x18);
+				
+				printf("SETLIGHTLEVEL\n");
+				
+				break;
+			}
+			case SETLIGHTCOLOR: //设置灯的颜色
+			{
+				DataTemp[0] = 0x19;
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x84;
+				DataTemp[8] = 0x10;
+				DataTemp[9] = 0x02;
+				
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = 0;
+				DataTemp[13] = 0;
+				DataTemp[14] = 0;
+				DataTemp[15] = 0;
+				DataTemp[16] = 0;  		
+				DataTemp[17] = 0;
+				DataTemp[18] = NetData[15];
+				DataTemp[19] = 0;
+				DataTemp[20] = 0;
+				
+				DataTemp[21] = NetData[16];
+				DataTemp[22] = NetData[17];
+				DataTemp[23] = NetData[19];
+				DataTemp[24] = NetData[18];
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x19);
+				
+				printf("SETLIGHTcolor\n");
+				
+				break;
+			}
+			
+			case GETLIGHTLEVEL:  //获取灯亮度
+			{
+				DataTemp[0] = 0x15;  				
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x86;
+				DataTemp[8] = 0x0C;
+				DataTemp[9] = 0x02;
+				
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = 0;
+				DataTemp[13] = 0;
+				DataTemp[14] = 0;
+				DataTemp[15] = 0;
+				DataTemp[16] = 0;  		
+				DataTemp[17] = 0;
+				DataTemp[18] = NetData[15];
+				DataTemp[19] = 0;
+				DataTemp[20] = 0;
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x15);
+				
+				printf("GETLIGHTLEVEL\n");
+				break;
+			}
+			case GETLIGHTCOLOR:  //获取灯颜色
+			{
+				DataTemp[0] = 0x15;  				
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x87;
+				DataTemp[8] = 0x0C;
+				DataTemp[9] = 0x02;
+				
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = 0;
+				DataTemp[13] = 0;
+				DataTemp[14] = 0;
+				DataTemp[15] = 0;
+				DataTemp[16] = 0;  		
+				DataTemp[17] = 0;
+				DataTemp[18] = NetData[15];
+				DataTemp[19] = 0;
+				DataTemp[20] = 0;
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x15);
+				
+				printf("GETLIGHTCOLOR\n");
+				break;
+			}
+			
+			case GETLIGHTSATURATION:  //获取灯饱和度
+			{
+				DataTemp[0] = 0x15;  				
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x88;
+				DataTemp[8] = 0x0C;
+				DataTemp[9] = 0x02;
+				
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = 0;
+				DataTemp[13] = 0;
+				DataTemp[14] = 0;
+				DataTemp[15] = 0;
+				DataTemp[16] = 0;  		
+				DataTemp[17] = 0;
+				DataTemp[18] = NetData[15];
+				DataTemp[19] = 0;
+				DataTemp[20] = 0;
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x15);
+				
+				printf("GETLIGHTSATURATION\n");
+				break;
+			}
+			
+			
+			case GETDEVICESTATE:		//获取设备状态 26
+			{
+				DataTemp[0] = 0x15;  				//1B 00 FF FF FF FF FE 8F 12 02 xx xx 00 00 00 00 00 00 endpoint 00 00 gnamelen name 
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x85;
+				DataTemp[8] = 0x0C;
+				DataTemp[9] = 0x02;
+				
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = 0;
+				DataTemp[13] = 0;
+				DataTemp[14] = 0;
+				DataTemp[15] = 0;
+				DataTemp[16] = 0;  		
+				DataTemp[17] = 0;
+				DataTemp[18] = NetData[15];
+				DataTemp[19] = 0;
+				DataTemp[20] = 0;
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x15);
+				
+				printf("GETDEVICESTATE\n");
+				
+				break;
+			}
+			case SETDEVICENAME: 			//设置设备名字10
+			{
+				DataTemp[0] = 13+NetData[16];  				
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x94;
+				DataTemp[8] = 4+NetData[16];
+
+				DataTemp[9] = NetData[14];
+				DataTemp[10] = NetData[13];
+				
+				DataTemp[11] = NetData[15];
+				
+				DataTemp[12] = NetData[16];
+				
+				memcpy(&DataTemp[13],&NetData[17],NetData[16]);
+
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,13+NetData[16]);
+				printf("SETDEVICENAME\n");
+				break;
+			}
+			case YXDEVICEINNET: 			//设备入网 11 
+			{
+				//0x08 0x00 0x78 0x56 0x34 0x12 0xFE 0x9F
+				DataTemp[0] = 0x08; 		
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x9F;
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,8);
+				DataTemp[0] = 'O';
+				TcpSendData(fd,YXDEVICEINNET,DataTemp,1);
+
+				//DorpTable(DEV_INFO);
+				
+				//CreateTable(DEV_INFO);
+				
+				printf("YXDEVICEINNET\n");
+				break;
+			}
+			case MODIFYGAWYNAME: 			//修改网关名字 12
+			{
+				Para->Device_NameLen = NetData[13];
+				memcpy(Para->DeviceName,&NetData[14],NetData[13]);
+				SetSysPara(Para);
+				
+				DataTemp[0] = 'O';
+				TcpSendData(fd,MODIFYGAWYNAME,DataTemp,1);
+				
+				notifyServerGatewayInfoChange();//liupeng add
+				printf("MODIFYGAWYNAME\n");
+				break;
+			}
+			case MODIFYGAWYPASS: 			//修改网关密码 13
+			{
+				Para->Passwordlen= NetData[13];
+				memcpy(Para->Password,&NetData[14],NetData[13]);
+				SetSysPara(Para);
+				
+				DataTemp[0] = 'O';
+				TcpSendData(fd,MODIFYGAWYPASS,DataTemp,1);
+				
+				notifyServerGatewayInfoChange();//liupeng add
+				printf("MODIFYGAWYPASS\n");
+				break;
+			}
+			case HUIFUGAWYSET: 			//恢复出厂设置 14
+			{
+				//0x08 0x00 0x78 0x56 0x34 0x12 0xFE 0x9F
+				DataTemp[0] = 0x0C; 		
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA1;
+				DataTemp[8] = 0x03;
+				DataTemp[9] = 0x55;
+				DataTemp[10] = 0xAA;
+				DataTemp[11] = 0x50;
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,12);
+				DataTemp[0] = 'O';
+				Para->SetFlag=0;
+				SetSysPara(Para);
+					
+				//TcpSendData(Devclient[i].fd,HUIFUGAWYSET,DataTemp,1);
+
+				//system("reboot");
+				//设备重启；
+				break;
+			}
+
+			case MODIFYGROUPNAME:			//0XCF		//修改组名字 23
+			{
+				DataTemp[0] = 0x0C+NetData[15]; 		 //liupeng modify 0519  设备索引3b  NetData[15]->NetData[16]
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xAF;
+				DataTemp[8] = 0x03+NetData[15];
+				
+				DataTemp[9] = NetData[14];
+				DataTemp[10] = NetData[13];
+				DataTemp[11] = NetData[15];
+				
+				memcpy(&DataTemp[12],&NetData[16],NetData[15]);
+				memcpy(strtmp,&NetData[16],NetData[15]);
+				strtmp[NetData[15]] = '\0';
+				
+				FindGroupUid(GROUP_INFO,(NetData[13]<<8)+NetData[14],&tGroupinfo);
+				printf("id:%d,id1:%d",NetData[13],NetData[14]);
+				if(tGroupinfo.Rs1>0)
+				{
+					memcpy(strnametmp,tGroupinfo.Name,tGroupinfo.Namelen);	//copy now val
+					strnametmp[tGroupinfo.Namelen] = '\0';
+					printf("namelen:%d",NetData[15]);
+					printf("name:%s",strnametmp);
+					tGroupinfo.Namelen = NetData[15];
+					memcpy(tGroupinfo.Name,strtmp,NetData[15]+1);
+					
+					Sqlctl->sql_update_Grouptable(db,GROUP_INFO,strnametmp,&tGroupinfo);
+					
+				}
+				else
+				{
+					//Sqlctl->sql_insert_Groupinfo(db,GROUP_INFO,tGroupinfo);
+				}
+
+
+				
+				/*
+				pf("MODIFYGROUPNAME to zll\n");
+				
+				jk=0;
+				for(k=0;k<DataTemp[0];k++) //liupeng . 打印出报文
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)DataTemp[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+				printf("\n");
+				*/
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);//liupeng 0526
+
+				TcpSendData(fd,MODIFYGROUPNAME,&NetData[13],3+NetData[15]);//liupeng 0526 
+				
+				break;
+			}
+			case ADDTIMERTASK: //添加定时任务
+			{
+				DataTemp[0] = 0x39 + NetData[19]; //带任务名称
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA3;
+				DataTemp[8] = 0x30+NetData[19]; //0523 liupeng 
+				DataTemp[9] = 0x02;
+				DataTemp[10] = 0x01; //定时任务
+				
+				DataTemp[11] = NetData[13]; //周工作模式
+				DataTemp[12] = NetData[14];//时
+				DataTemp[13] = NetData[15];//分
+				DataTemp[14] = NetData[16];//秒
+				for(jk=0;jk<15;jk++)
+				{
+					DataTemp[15+jk] = 0;
+				}
+				DataTemp[30] = 0x02;
+				DataTemp[31] = NetData[18]; //scene id
+				DataTemp[32] = NetData[17];
+				
+				for(i=0;i<23;i++)
+				{
+					DataTemp[33+i] = 0;
+				}
+				DataTemp[33+17] = 1;//开报警  liupeng add
+				DataTemp[33+18] = 1;//开使能 //liupeng add
+				DataTemp[33+23] = NetData[19];
+				memcpy(&DataTemp[57],&NetData[20],NetData[19]);
+				
+				
+				pf("ADDTIMERTASK to zll\n");
+				
+				jk=0;
+				for(k=0;k<DataTemp[0];k++) //liupeng . 打印出报文
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)DataTemp[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+				printf("\n");
+			
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				
+				break;
+			}
+		
+			case SETSENORRUNCJ:			//0XCD		//设置传感器触发场景
+			{
+				DataTemp[0] = 0x39+NetData[33]; 		//带任务名称
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA3;
+				DataTemp[8] = 0x30+NetData[33]; //0523 liupeng 
+				
+				DataTemp[9] = 0x02;
+				DataTemp[10] = 0x03;
+				DataTemp[11] = NetData[15];
+				DataTemp[12] = NetData[14];
+				
+				DataTemp[13] = 0xff & IDmetofeibi(NetData[13]); //liupeng 0526
+				DataTemp[14] = IDmetofeibi(NetData[13])>>8;
+				DataTemp[15] = NetData[16];
+
+				memcpy(&DataTemp[16],&NetData[19],14);
+
+				DataTemp[30] = 0x02; //liupeng DataTemp[29]-DataTemp[30]
+				DataTemp[31] = NetData[18]; //liupeng modify 0524
+				DataTemp[32] = NetData[17];
+
+				for(i=0;i<23;i++)
+				{
+					DataTemp[33+i] = 0;
+				}
+				DataTemp[33+17] = 1;//开报警  liupeng add
+				DataTemp[33+18] = 1;//开使能 //liupeng add
+				DataTemp[33+23] = NetData[33];
+				memcpy(&DataTemp[57],&NetData[34],NetData[33]);
+				
+				/*
+				pf("SETSENORRUNCJ to zll\n");
+				
+				jk=0;
+				for(k=0;k<DataTemp[0];k++) //liupeng . 打印出报文
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)DataTemp[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+				printf("\n");
+				*/
+			
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				
+				break;
+			}
+			case GETALLTASKLIST: //获取任务列表  liupeng 0519
+			{
+				DataTemp[0] = 0x08;  				
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA6;
+				
+				/*
+				pf("GET ALL TASK LIST");
+				jk=0;
+				for(k=0;k<DataTemp[0];k++) //liupeng . 打印出报文
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)DataTemp[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+				printf("\n");
+				*/
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				break;
+			}
+			case GETTASKINFO://获取指定任务详情
+			{
+				DataTemp[0] = 10+NetData[13];
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA5;
+				
+				DataTemp[8] = 1+NetData[13];
+				DataTemp[9] = NetData[13];
+				memcpy(&DataTemp[10],&NetData[14],NetData[13]);
+				
+				
+				pf("GET TASK INFO");
+				jk=0;
+				for(k=0;k<DataTemp[0];k++) //liupeng . 打印出报文
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)DataTemp[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+				printf("\n");
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				
+				printf("andy,get task info...\n");
+				
+				break;
+			}
+			case DELETETASK://删除任务
+			{
+				DataTemp[0] = 10+NetData[13];
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA4;
+				
+				DataTemp[8] = 1+NetData[13];
+				DataTemp[9] = NetData[13];
+				memcpy(&DataTemp[10],&NetData[14],NetData[13]);
+				
+				/*
+				pf("DELETE TASK");
+				jk=0;
+				for(k=0;k<DataTemp[0];k++) //liupeng . 打印出报文
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)DataTemp[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+				printf("\n");
+				*/
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				
+				printf("andy,get task info...\n");
+				break;
+			}
+			case SAVEIRDATATOGATEWAY://保存透传数据到网关
+			{
+				int nameLen = NetData[16];
+				int irDataLen = NetData[19+NetData[16]];
+				DataTemp[0] = 19 + nameLen+irDataLen;
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA7;
+				
+				DataTemp[8] = 10+nameLen+irDataLen;
+				
+				DataTemp[9] = NetData[14];//device address
+				DataTemp[10] = NetData[13];
+				DataTemp[11] = NetData[15];
+				
+				DataTemp[12] = 0x04;
+				DataTemp[13] = 2+nameLen+irDataLen; //liupeng 0527
+				DataTemp[14] =0;
+				
+				DataTemp[15] = irDataLen; //liupeng 0527
+				memcpy(&DataTemp[16],&NetData[20+nameLen],irDataLen);
+				
+				int index = 16+irDataLen;
+				DataTemp[index] = nameLen;
+				index++;
+				memcpy(&DataTemp[index],&NetData[17],nameLen);
+				
+				int index2 = index+nameLen;
+				DataTemp[index2] = NetData[18+nameLen];// IR ID
+				DataTemp[index2+1] = NetData[17+nameLen];
+				
+				/*
+				pf("SAVE IR DATA TO GATEWAY to zll");
+				
+				jk=0;
+				for(k=0;k<DataTemp[0];k++) //liupeng . 打印出报文
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)DataTemp[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+				printf("\n");
+				*/
+				
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				
+				printf("andy,save ir data to gateway....\n");
+				
+				break;
+			}
+			case GETALLIRDATA: //获取网关红外数据
+			{
+				DataTemp[0] = 0x0d;
+				DataTemp[1] = 0x00;
+				
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA7;
+				
+				DataTemp[8] = 0x04;
+				DataTemp[9] =0;
+				DataTemp[10] =0;
+				DataTemp[11] =0;
+				DataTemp[12] = 0x05;
+				
+				/*
+				pf("GET ALL IR DATA to zll");
+				
+				jk=0;
+				for(k=0;k<DataTemp[0];k++) //liupeng . 打印出报文
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)DataTemp[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+				printf("\n");
+				*/
+				
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				break;
+			}
+			case SENDIRDATA://发送红外透传数据
+			{
+				DataTemp[0] = 14;
+				DataTemp[1] =0;
+				
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA7;
+				
+				DataTemp[8] = 6;//bao chang
+				DataTemp[9] = NetData[14]; //short address
+				DataTemp[10] = NetData[13];
+				DataTemp[11] = NetData[15];
+				
+				DataTemp[12] = 0x06;
+				DataTemp[13] = NetData[17];//ir id
+				DataTemp[14] = NetData[16];
+				
+				pf("send ir data...");
+				jk=0;
+				for(k=0;k<DataTemp[0];k++) //liupeng . 打印出报文
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)DataTemp[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+				printf("\n");
+				
+				
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				
+				break;
+			}
+			case DELETEIRDATA: //删除网关红外数据
+			{
+				DataTemp[0] = 16;
+				DataTemp[1] =0;
+				
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA7;
+				
+				DataTemp[8] = 8;//bao chang
+				DataTemp[9] = NetData[14]; //short address
+				DataTemp[10] = NetData[13];
+				DataTemp[11] = NetData[15];
+				
+				DataTemp[12] = 0x07;
+				DataTemp[13] = 0;
+				DataTemp[14] =0;
+				DataTemp[15] = NetData[17];//ir id
+				//DataTemp[16] = NetData[16];
+				
+				pf("delete ir data...");
+				jk=0;
+				for(k=0;k<DataTemp[0];k++) //liupeng . 打印出报文
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)DataTemp[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+				printf("\n");
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				break;
+			}
+			case DELETEDEVICE:			//0x07		//设备节点删除
+			{
+
+				FindDev((NetData[13]<<8)+NetData[14],NetData[15],&tDevinfo);
+				
+				DataTemp[0] = 0x15;  				//1B 00 FF FF FF FF FE 8F 12 02 xx xx 00 00 00 00 00 00 endpoint 00 00 gnamelen name 
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x95;
+				DataTemp[8] = 0x0C;
+				DataTemp[9] = 0x02;
+				
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				
+				DataTemp[12] = tDevinfo.Rs1>>24;
+				DataTemp[13] = tDevinfo.Rs1>>16;
+				DataTemp[14] = tDevinfo.Rs1>>8;
+				DataTemp[15] = tDevinfo.Rs1;
+				DataTemp[16] = tDevinfo.Rs2>>24;		
+				DataTemp[17] = tDevinfo.Rs2>>16;
+				DataTemp[18] = tDevinfo.Rs2>>8;
+				DataTemp[19] = tDevinfo.Rs2;
+				
+				DataTemp[20] = NetData[15];
+
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x15);
+
+				/*从本地数据库删除设备*/
+				DeleteDev(tDevinfo.ShortAddr,tDevinfo.Endpoint);
+				
+				printf("DELETEDEVICE\n");
+				break;
+			}
+			case DEVICEADDTOAPP:			//0x07		//设备节点新增上传 
+			{
+				
+				break;
+			}
+			case SENERCALSET :				//0x0A		//传感器报警数据上传
+			{
+				Para->BfCfflag = NetData[13];
+				
+				DataTemp[0] = 'O';
+				TcpSendData(fd,SENERCALSET,DataTemp,1);
+
+				SetSysPara(Para);
+				
+				
+				break;
+			}
+		
+			case CALSENORRUNCJ	:		//0XCB		//取消传感器触发场景
+			{
+				
+				break;
+			}
+
+			case DEVICENAMEMODIFYTOAPP: 	//0x05		//设备名字修改上传
+			{
+				
+				break;
+			}
+			case STARTXUEXIIR:			//0xCA		//开始学习红外
+			{
+				DataTemp[0] = 0x11;  				//1B 00 FF FF FF FF FE 8F 12 02 xx xx 00 00 00 00 00 00 endpoint 00 00 gnamelen name 
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA7;
+				DataTemp[8] = 0x09;
+				
+				DataTemp[9] = NetData[14];
+				DataTemp[10] = NetData[13];
+				DataTemp[11] = NetData[15];
+				DataTemp[12] = 2;
+				DataTemp[13] = 3;
+				DataTemp[14] = 0;
+				DataTemp[15] = 0x10;  		
+				DataTemp[16] = 0x40;
+
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x15);
+				
+				printf("STARTXUEXIIR\n");
+				break;
+			}
+			case SENDRI :					//0xC9		//发送红外
+			{
+				DataTemp[0] = 0x11;  				//1B 00 FF FF FF FF FE 8F 12 02 xx xx 00 00 00 00 00 00 endpoint 00 00 gnamelen name 
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA7;
+				DataTemp[8] = 0x09;
+				
+				DataTemp[9] = NetData[14];
+				DataTemp[10] = NetData[13];
+				DataTemp[11] = NetData[15];
+				DataTemp[12] = 3;
+				DataTemp[13] = 3;
+				DataTemp[14] = 0;
+				DataTemp[15] = 0x10;  		
+				DataTemp[16] = 0x40;
+
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x15);
+				
+				printf("SENDRI\n");
+				break;
+			}
+			case ADDRITOCJ 	:			//0xC8		//增加红外命令到场景
+			{
+				
+				break;
+			}
+			case SETRINAME :				//0xC7		//设置红外命令名字
+			{
+				
+				break;
+			}
+			case GETRILIST :				//0xE4		//获取红外列表
+			{
+				
+				break;
+			}
+			case GETRIDATA: 				//0xC6		//获取红外数据
+			{
+				
+				break;
+			}
+			
+			case 0xFB: 				//0xC6	握手应答
+			{
+				PCTx->PC_TX_Out_En = 0;
+				PCTx->PC_TX_Time_Out = PC_ACK_TIME;
+
+				
+				//DataTemp[0]='O';
+				//TcpSendData(Devclient[i].fd,0xFB,DataTemp,1);
+				break;
+			}
+			case 0xFA:
+			{
+				
+				PCTx->PC_TX_Out_En = 0;
+				PCTx->PC_TX_Time_Out = PC_ACK_TIME;
+
+				Para->GatewaySn = (NetData[13]<<24);
+				Para->GatewaySn |= (NetData[14]<<16);
+				Para->GatewaySn |= (NetData[15]<<8);
+				Para->GatewaySn |= (NetData[16]);
+
+				SetSysPara(Para);
+				
+				//DataTemp[0] = 'O';
+				//TcpSendData(Devclient[i].fd,MODIFYGAWYNAME,DataTemp,1);
+				printf("Reg Gateway Sn:%x\n",Para->GatewaySn);
+				
+			}
+			case 0xA7:			//数据透传；设备索引+数据包长度（2b）+数据
+			{
+							//1B 00 FF FF FF FF FE 8F 12 02 xx xx 00 00 00 00 00 00 endpoint 00 00 gnamelen name 
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA7;
+				
+
+				DataTemp[9] = NetData[14];				//
+				DataTemp[10] = NetData[13];		
+				DataTemp[11] = NetData[15];		
+
+				DataTemp[12] = 0x03;		
+
+				Dlen = NetData[16]<<8;
+				Dlen |= NetData[17];
+
+				page = Dlen/0x40+((Dlen%0x40)? 1 : 0);
+				
+				for(i=0;i<page;i++)
+				{
+					if(i==(page-1))
+					{
+						DataTemp[13+i*42] = Dlen%0x40;		//包长；
+						DataTemp[14+i*42] = i;		//第几包；
+						memcpy(&DataTemp[15+i*42],&NetData[18+i*40],Dlen%0x40);
+
+						DataTemp[0] = (Dlen%0x40)+15;  
+						DataTemp[8] = (Dlen%0x40)+9; 
+						
+						ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,(Dlen%0x40)+15);
+						usleep(100000);
+					}
+					else
+					{
+						DataTemp[13+i*0x42] = 0x40;		//包长；
+						DataTemp[14+i*0x42] = i;		//第几包；
+						memcpy(&DataTemp[15+i*0x42],&NetData[18+i*40],0x40);
+
+						DataTemp[0] = 0x4F;  
+						DataTemp[8] = 0x46;
+						ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x4F);
+						usleep(100000);
+					}
+				}
+
+				printf("Tou_Chuan_Data\n");
+				
+				break;
+			}
+			case 0XA8:				//设备绑定设备或者场景
+			{
+				DataTemp[0] = 0x17;  				//1B 00 FF FF FF FF FE 8F 12 02 xx xx 00 00 00 00 00 00 endpoint 00 00 gnamelen name 
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x8D;
+				
+				DataTemp[8] = 0x0f;
+				DataTemp[9] = 0x02;
+				
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = NetData[15];
+
+				DataTemp[13] = 0x05;
+				DataTemp[14] = 0x00;
+
+				DataTemp[15] = 0x01;
+				DataTemp[16] = 0x00;
+
+				DataTemp[17] = 0x10;
+
+				DataTemp[18] = 0x04;
+				DataTemp[19] = 0x04;
+				DataTemp[20] = 0xf0;
+				DataTemp[21] = 0xf0;
+				DataTemp[22] = NetData[16];
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x17);
+								
+				printf("qingjing kaiguan bangding \n");
+
+				
+				
+				break;
+			}
+			case 0XA9:				//获取绑定记录
+			{
+				DataTemp[0] = 0x0A;  				//0x1F 0x00 0x78 0x56 0x34 0x12 0xFE 0x8d 0x01 0x08
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x8D;
+				
+				DataTemp[8] = 0x01;
+				DataTemp[9] = 0x08;
+			
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x0A);
+								
+				printf("qingjing kaiguan huoqu \n");
+
+				
+				
+				break;
+			}
+			case SETLIGHTCOLORTEMP :  //设置灯的色温
+			{
+				DataTemp[0] = 0x19;
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA8;
+				DataTemp[8] = 0x010;
+				DataTemp[9] = 0x02;
+				
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = 0;
+				DataTemp[13] = 0;
+				DataTemp[14] = 0;
+				DataTemp[15] = 0;
+				DataTemp[16] = 0;  		
+				DataTemp[17] = 0;
+				DataTemp[18] = NetData[15];
+				DataTemp[19] = 0;
+				DataTemp[20] = 0;
+				
+				DataTemp[21] = NetData[17];//color temp
+				DataTemp[22] = NetData[16];
+				DataTemp[23] = NetData[19]; // time
+				DataTemp[24] = NetData[18];
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x19);
+				
+				printf("SETLIGHTCOLORTEMP\n");
+				
+				break;
+			}
+			case GETLIGHTCOLORTEMP :  //获取灯的色温
+			{
+				DataTemp[0] = 0x15;  				
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xA9;
+				DataTemp[8] = 0x0C;
+				DataTemp[9] = 0x02;
+				
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = 0;
+				DataTemp[13] = 0;
+				DataTemp[14] = 0;
+				DataTemp[15] = 0;
+				DataTemp[16] = 0;  		
+				DataTemp[17] = 0;
+				DataTemp[18] = NetData[15];
+				DataTemp[19] = 0;
+				DataTemp[20] = 0;
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x15);
+				
+				printf("GETLIGHTCOLORTEMP\n");
+				break;
+			}
+			case CONFIGSCENESWITCH://配置场景开关
+			{
+				DataTemp[0] = 0x17;  				
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x8D;
+				
+				DataTemp[8] = 0X0E;
+				DataTemp[9] = 0X02;
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = NetData[15];
+				
+				DataTemp[13] = 0X05;
+				DataTemp[14] = 0X00;
+				DataTemp[15] = 0x01;
+				DataTemp[16] = 0x00;
+				DataTemp[17] = 0X10;
+				
+				DataTemp[18] = 0X04;
+				DataTemp[19] = 0X04;
+				DataTemp[20] = 0xF0;
+				DataTemp[21] = 0xF0;
+				DataTemp[22] = NetData[16]; //场景ID
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x17);
+				
+				printf("CONFIGSCENESWITCH\n");
+				break;
+				
+			}
+			case COLORLOOPSET://灯具自动变色  liupeng 0608
+			{
+				DataTemp[0] = 0x1B;  				
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x8D;
+				
+				DataTemp[8] = 0X12;
+				DataTemp[9] = 0X02;
+				DataTemp[10] = NetData[14];
+				DataTemp[11] = NetData[13];
+				DataTemp[12] = NetData[15];
+				
+				DataTemp[13] = 0X00;
+				DataTemp[14] = 0X03;
+				DataTemp[15] = 0x01;
+				DataTemp[16] = 0x00;
+				DataTemp[17] = 0X10;
+				
+				DataTemp[18] = 0X08;
+				DataTemp[19] = 0X44;
+				DataTemp[20] = 0x07;
+				DataTemp[21] = 0x01;
+				DataTemp[22] = NetData[16]; //颜色变化方向 0-递减 1-递增
+				
+				DataTemp[23] = NetData[18];//一个循环周期时间  以秒为单位
+				DataTemp[24] = NetData[17];
+				DataTemp[25] = NetData[20];//起始HUE值
+				DataTemp[26] = NetData[19];
+				
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,0x1B);
+				
+				printf("COLORLOOPSET\n");
+				break;
+				
+			}
+			case OPERATELOCK://操作门锁
+			{
+				DataTemp[0] =23 + NetData[17];  				
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x82;
+				
+				DataTemp[8] = 0x14;
+				DataTemp[9] = 0x02;
+				DataTemp[10] = NetData[14];//short address
+				DataTemp[11] = NetData[13];
+				
+				DataTemp[12] = 0x00;
+				DataTemp[13] = 0x00;
+				DataTemp[14] = 0x00;
+				DataTemp[15] = 0x00;
+				DataTemp[16] = 0x00;
+				DataTemp[17] = 0x00;
+				
+				DataTemp[18] = NetData[15];//endpoint
+				DataTemp[19] = 0x00;
+				DataTemp[20] = 0x00;
+				DataTemp[21] = NetData[16];//开1 关0
+				DataTemp[22] = NetData[17];//password length
+				
+				memcpy(&DataTemp[23],&NetData[18],NetData[17]);//password
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				
+				printf("OPERATELOCK\n");
+				break;
+				
+			}
+			case SETSYSTIME : //设置系统时间
+			{
+				// eg.    042817252009.00
+				if(NetData[13] == 15)
+				{
+					memcpy(&timeBuf[0],&NetData[14],NetData[13]);
+					jk= sprintf(cmdBuf,"date %s",timeBuf);
+					cmdBuf[20] = '\0';
+					
+					pf(cmdBuf);
+					
+					system(cmdBuf);
+					
+					usleep(100000);
+					
+					system("hwclock -w");
+					usleep(100000);	
+					
+					DataTemp[0]='O';
+					
+					TcpSendData(fd,SETSYSTIME,DataTemp,1);
+					SetSysPara(Para);
+					usleep(300000);
+					system("reboot");
+					
+				}
+				else
+				{
+					DataTemp[0]='E';
+					TcpSendData(fd,SETSYSTIME,DataTemp,1);
+				}
+				break;
+			}
+			case GETSYSTIME:
+			{
+				FM_Read_Time(DataTemp);
+				
+				TcpSendData(fd,GETSYSTIME,DataTemp,7);
+				
+				break;
+			}
+			case REBOOT ://重启系统   数据包带密码
+			{
+				int pwdLen = Para->Passwordlen;
+				
+				if(DataLen != pwdLen)
+				{
+					DataTemp[0]='E';
+					TcpSendData(fd,REBOOT,DataTemp,1);
+					
+					printf("reboot, password len error!\n");
+					return;
+				}
+				//
+				for(i=0;i<DataLen;i++)
+				{
+					if(Para->Password[i]!=NetData[13+i])
+					{
+						DataTemp[0]='E';
+						TcpSendData(fd,REBOOT,DataTemp,1);
+						printf("reboot, password  error!\n");
+						return ;
+					}
+				}
+				SetSysPara(Para);
+				DataTemp[0]='O';
+				TcpSendData(fd,REBOOT,DataTemp,1);
+				usleep(300000);
+				system("reboot");
+				break;
+			}
+			case DEFENCE: //布防撤防 0702 liupeng
+			{
+				//设备数量 N 13 
+				//设备地址  NetData[14]  NetData[15] NetData[16] 
+				//布防状态：NetData[17]
+
+				for(i=0;i<NetData[13];i++)
+				{
+					FindDev((NetData[14+4*i]<<8)+NetData[15+4*i],NetData[16+4*i],&tDevinfo);
+
+					if(tDevinfo.Sn != -1) 
+					{
+						tDevinfo.Rs3 = NetData[17+4*i];
+						printf("NetData[17]1:%d\n",NetData[17+4*i]);
+						if(Sqlctl->sql_update_Devtable(db,DEV_INFO,tDevinfo.ShortAddr,tDevinfo.Endpoint,&tDevinfo)!=0)
+						{
+							printf("update data error\n");
+						}
+						printf(" data\n");
+					}
+					else
+					{	
+						//if(Sqlctl->sql_insert_Devinfo(db,DEV_INFO,&dev_info)!=0)
+						{
+							printf("No find dev - DEFENCE ! \n");
+						//	return;
+						}
+					}
+					
+				}
+
+				printf("update data\n");
+				//usleep(20000);
+				
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].fd >0)
+					{
+						TcpSendData(Devclient[i].fd,DEFENCE,&NetData[13],(NetData[10]<<8)+NetData[11]);
+						usleep(10000);
+					}
+				}
+				
+				break;
+			}
+			case PREPARE_UPGRADE: //为网关升级准备
+			{
+				AddressBK = 0;
+				Address = 0;
+				fclose(upfd);
+
+				system("cp /opt/mainapptemp /opt/main");
+				
+				printf("updata mainapp end\n");
+				
+				DataTemp[0]='O';
+				for(i=0;i<NetMenNum;i++)
+				{
+					//通知已经连接运行稳定的手机端
+					if(Devclient[i].fd > 0)
+					{
+						TcpSendData(Devclient[i].fd,REBOOT,DataTemp,1);
+						usleep(1000);
+					}
+				}
+
+				SetSysPara(Para);		
+
+				usleep(300000);
+				system("reboot");
+				
+				break;
+			}
+			case UPGRADE://网关升级报文 
+			{
+				//文件大小 包含字节总数 NetData[13] - NetData[16] 
+			    //总数据包数量  文件大小/1000+1
+				//当前数据包索引
+				//当前数据包长度  判断是否是最后一个数据包
+				//当前数据包内容 写入文件中 
+				//重启网关  启动新程序
+				//pttcp = GetNetMem(fd);
+				//printf("updata mainapp1 :%d,%d,%d\n",fd,Address,pttcp);
+				UpData = &NetData[17];   
+
+				Address = (NetData[15]<<24);
+				Address |= (NetData[16]&0xff);	
+				
+				if(Address == (AddressBK+1))
+				{
+					if(AddressBK==0)
+					{
+						upfd = fopen("/opt/mainapptemp","wb+");
+					}
+
+					fwrite(UpData,((NetData[10]<<8)+NetData[11])-4,1,upfd);
+					
+					AddressBK = Address;
+				}
+				else if(Address==0x00)
+				{
+					AddressBK = 0;
+					Address = 0;
+					system("rm /opt/mainapptemp");
+				}
+				else if(Address==0xffff) 
+				{
+					AddressBK = 0;
+					Address = 0;
+					fclose(upfd);
+					system("rm /opt/mainapptemp");
+				}
+				DataTemp[0] = NetData[13];
+				DataTemp[1] = NetData[14];
+				DataTemp[2] = (AddressBK&0xFF00)>>8;
+				DataTemp[3] = AddressBK;
+
+				TcpSendData(fd,UPGRADE,DataTemp,4);
+				//pttcp = GetNetMem(fd);
+				printf("updata mainapp :%d,%d\n",fd,Address);
+				break;
+			}
+			case GET_DOOR_LOCK_ENABLE: //获取门锁控制状态
+			{
+				DataTemp[0] =0x0d;		
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xAD;
+				
+				DataTemp[8] = 0x04;
+				
+				DataTemp[9] = NetData[14];//short address
+				DataTemp[10] = NetData[13];
+				DataTemp[11] = NetData[15];//endpoint
+				DataTemp[12] = 0x82;
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				
+				printf("get doorlock enable state\n");
+				break;
+			}
+			case SET_DOOR_LOCK_ENABLE: //设置门锁控制状态
+			{
+				DataTemp[0] =0x0e;		
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xAD;
+				
+				DataTemp[8] = 0x05;
+				
+				DataTemp[9] = NetData[14];//short address
+				DataTemp[10] = NetData[13];
+				DataTemp[11] = NetData[15];//endpoint
+				DataTemp[12] = 0x02;
+				DataTemp[13] = NetData[16];
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				
+				break;
+			}
+			case GET_DOOR_LOCK_STATE://读取门锁状态
+			{
+				DataTemp[0] =0x0e;		
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xAD;
+				
+				DataTemp[8] = 0x05;
+				
+				DataTemp[9] = NetData[14];//short address
+				DataTemp[10] = NetData[13];
+				DataTemp[11] = NetData[15];//endpoint
+				DataTemp[12] = 0x03;
+				DataTemp[13] = 0x01;
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				
+				break;
+			}
+			case SET_DOOR_LOCK_TIME:
+			{
+				DataTemp[0] =0x11;		
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xAD;
+				
+				DataTemp[8] = 0x08;
+				
+				DataTemp[9] = NetData[14];//short address
+				DataTemp[10] = NetData[13];
+				DataTemp[11] = NetData[15];//endpoint
+				DataTemp[12] = 0x01;
+				DataTemp[13] = NetData[16];
+				DataTemp[14] = NetData[17];
+				DataTemp[15] = NetData[18];
+				DataTemp[16] = NetData[19];
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				break;
+			}
+			case GET_DOOR_LOCK_TIME:
+			{
+				DataTemp[0] =0x0d;		
+
+				DataTemp[1] = 0x00;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0xAD;
+				
+				DataTemp[8] = 0x04;
+				
+				DataTemp[9] = NetData[14];//short address
+				DataTemp[10] = NetData[13];
+				DataTemp[11] = NetData[15];//endpoint
+				DataTemp[12] = 0x81;
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,DataTemp[0]);
+				break;
+			}
+			case SET_SERVER_ADDR:
+			{
+				Para->DIP_Addr[0] = NetData[13];
+				Para->DIP_Addr[1] = NetData[14];
+				Para->DIP_Addr[2] = NetData[15];
+				Para->DIP_Addr[3] = NetData[16];
+				
+				SetSysPara(Para);
+				DataTemp[0] = 'O';
+				TcpSendData(fd,SET_SERVER_ADDR,DataTemp,1);
+				
+				system("reboot");
+			}
+			case GETGATEVSION:
+			{
+				
+				DataTemp[0] = Para->DeviceVersion>>8;
+				DataTemp[1] = Para->DeviceVersion;
+				
+				DataTemp[2] = Para->codeVersion>>24;
+				DataTemp[3] = Para->codeVersion>>16;
+				DataTemp[4] = Para->codeVersion>>8;
+				DataTemp[5] = Para->codeVersion;
+				
+				TcpSendData(fd,GETGATEVSION,DataTemp,6);
+			}
+			default:
+			{
+				
+				break;
+			}
+				
+		}
+	}
+	else 
+	{
+		
+	}
+
+	memset(TCP_Rx_STR->Rx_Data,0,50);
+}
+
+
+//获取zigbee数据
+int GetZigbeeData(unsigned char * Data_Rx)
+{
+	PT_NetDeviceOpr ptNetDeviceOpr;
+	PT_NetMemOpr ptMen;
+	static int len;
+	int i;
+	
+
+	ptNetDeviceOpr = GetNetDeviceOpr("zll");
+
+	if(ptNetDeviceOpr)
+		ptMen = GetNetMemData(ptNetDeviceOpr->fd);
+	else 
+		return -1;
+
+	if (ptMen)
+	{
+
+		if(ptMen->EndAddr==ptMen->HeadAddr)
+		return -1;
+
+
+		//if()
+		
+		
+		if((ptMen->HeadAddr-ptMen->EndAddr)>=(ptMen->DataAddr[ptMen->EndAddr+1]+2))
+		{
+			memcpy(Data_Rx,&ptMen->DataAddr[ptMen->EndAddr],ptMen->DataAddr[ptMen->EndAddr+1]+2);
+
+			//printf("End:%d,Head:%d\n",ptMen->EndAddr,ptMen->HeadAddr);
+			
+			len = ptMen->DataAddr[ptMen->EndAddr+1]+2;
+		
+			memset(&ptMen->DataAddr[ptMen->EndAddr],0,len);
+
+			ptMen->EndAddr += len;
+
+			//printf("End:%d\n",ptMen->DataLen);
+			
+			if(ptMen->EndAddr >= NETMEMSIZE)
+				ptMen->EndAddr = 0;
+			//printf("End1:%d\n",len);
+			return (len);
+		}
+		else if(ptMen->EndAddr>ptMen->HeadAddr)
+		{
+			//printf("End:%d,Head:%d\n",ptMen->EndAddr,ptMen->HeadAddr);
+
+			if(ptMen->DataAddr[ptMen->EndAddr+1]>0)
+			{
+				len = ptMen->DataAddr[ptMen->EndAddr+1]+2;
+				
+				memcpy(Data_Rx,&ptMen->DataAddr[ptMen->EndAddr],len);
+
+				memset(&ptMen->DataAddr[ptMen->EndAddr],0,len);
+				
+				ptMen->EndAddr += len;
+
+				if(ptMen->EndAddr >= (NETMEMSIZE))
+					ptMen->EndAddr = 0;
+			
+			}
+			else
+			{
+				printf("End1:%d,Head1:%d\n",ptMen->EndAddr,ptMen->HeadAddr);
+				ptMen->EndAddr = 0;
+			}
+			printf("-------------data limit-------------\n");
+			
+			return (ptMen->DataAddr[ptMen->EndAddr+1]+2);
+		}
+		else 
+		{
+			usleep(500000);
+			
+			printf("-------------Fei bi data error!\n-------------");
+			printf("End:%d,Head:%d\n",ptMen->EndAddr,ptMen->HeadAddr);
+			
+			for(i=0;i<(len+50);i++)
+				printf("%2X ",(unsigned char)*(&(ptMen->DataAddr[ptMen->EndAddr-len+i])));
+
+			ptMen->EndAddr = 0;
+			
+			printf("\n------------- write error data!\n  -----------");
+		}
+		
+	}
+	return -1;
+	
+}
+
+
+
+//获取zigbee数据处理协议；
+void RxZigbeeProcess(PT_TCP_Rx_Opr TCP_Rx_STR)
+{
+	int i;
+	int k;
+	int jk;
+	char andyBuf[1024];
+
+	unsigned char sqltemp[15];
+	unsigned char *sql = "%d.%d.%d.%d";
+	unsigned char *Data;
+	unsigned char DataTemp[1024];
+	
+	PT_SqlStoreOpr Sqlctl;
+	T_DevInfo_Opr dev_info,tDevinfo;
+	T_GroupInfo_Opr Groupinfo,tGroupinfo;
+	unsigned char strtmp[100];
+	PT_Sys_Para_Opr Para;
+	int ShortAddr,Endpoint;
+	
+	ReceParam rp ;
+	T_Selcet_Opr rpdata;
+	int ieee,ieee2;
+	short devicetype;
+	Sqlctl = GetDefultSqlOpr();
+	Para = GetDefultSysParaOpr();					//获取系统参数；
+	
+	//printf("error\n");
+	if(GetZigbeeData(TCP_Rx_STR->Rx_Data)>0)		//大于0说明zigbee有数据发过来；
+	{//printf("error1\n");
+		Data = TCP_Rx_STR->Rx_Data;					
+		//printf("10%d!\n",Data[0]);
+		//printf("error2\n");
+		switch(Data[0])
+		{
+			case 0x01: 			/*发现设备*/
+			{	//printf("find_Devinfo\n");
+				//printf("11!\n");
+				dev_info.Sn = Data[4];
+				dev_info.Sn |= Data[2]<<8;
+				dev_info.Sn |= Data[3]<<16;
+				
+				dev_info.ShortAddr = Data[2];	//短地址
+				dev_info.ShortAddr |= Data[3]<<8;	//短地址
+				dev_info.Endpoint  = Data[4];	//通路地址
+				
+				dev_info.ProfileID = Data[5];	//Profileid
+				dev_info.ProfileID |= Data[6]<<8;	//Profileid
+				
+				dev_info.DeviceID  = Data[7];	//设备ID
+				dev_info.DeviceID  |= Data[8]<<8;	//设备ID
+				
+				dev_info.DevState  = Data[9];	//设备状态
+				
+				dev_info.Namelen = Data[10];	//名字长度
+
+				memset(dev_info.Name,0,22);
+				memcpy(dev_info.Name,&Data[11],Data[10]);
+				
+
+				dev_info.OnlineState = Data[11+Data[10]];//在线状态
+				
+				dev_info.ZoneType = Data[21+Data[10]+Data[20+Data[10]]];
+				dev_info.ZoneType |= (Data[22+Data[10]+Data[20+Data[10]]]<<8);
+				
+				dev_info.Rs1 = Data[12+Data[10]]<<24;
+				dev_info.Rs1 = Data[13+Data[10]]<<16;
+				dev_info.Rs1 = Data[14+Data[10]]<<8;
+				dev_info.Rs1 = Data[15+Data[10]];
+
+				dev_info.Rs2 = Data[16+Data[10]]<<24;
+				dev_info.Rs2 = Data[17+Data[10]]<<16;
+				dev_info.Rs2 = Data[18+Data[10]]<<8;
+				dev_info.Rs2 = Data[19+Data[10]];
+				//
+				dev_info.pRs6 = NULL;
+				
+ 				tDevinfo.ShortAddr = dev_info.ShortAddr;
+ 				tDevinfo.Endpoint = dev_info.Endpoint;
+ 				
+				FindDev(tDevinfo.ShortAddr,tDevinfo.Endpoint,&tDevinfo);
+				
+				//printf("RX feibi device data\n");
+				
+				if(tDevinfo.Sn != -1) 
+				{
+					//printf("update data:%d,%d \n",dev_info.ShortAddr,tDevinfo.Endpoint);
+					//printf("update data: %d,%d\n",dev_info.Rs3,tDevinfo.Rs3);
+					dev_info.DevState = tDevinfo.DevState;
+					dev_info.Rs3 = tDevinfo.Rs3;
+
+					if(dev_info.OnlineState!=tDevinfo.OnlineState)
+					{
+						DataTemp[0] = 1;//设备总数为1
+						DataTemp[1] = 0xB6;
+						DataTemp[2] = 33;
+						DataTemp[3] = tDevinfo.ShortAddr>>8; 	//短地址
+						DataTemp[4] = tDevinfo.ShortAddr;		//短地址
+						DataTemp[5] = tDevinfo.Endpoint; 		//从地址
+							
+						DataTemp[6] = IDfeibitome(tDevinfo.DeviceID,tDevinfo.ZoneType);		//设备ID
+						/*
+						printf("----------ShortAddr:%2X,Endpoint:%2X,deviceid:%2X,ZoneType:%2X,----------\n",tDevinfo.ShortAddr,\
+																											tDevinfo.Endpoint,\
+																											tDevinfo.DeviceID,\
+																											tDevinfo.ZoneType
+																												);
+																									
+							*/
+						DataTemp[7] = tDevinfo.BDType1; 	
+						DataTemp[8] = tDevinfo.BDTypeSn1>>8; 
+						DataTemp[9] = tDevinfo.BDTypeSn1; 
+						DataTemp[10] = tDevinfo.BDType2; 	
+						DataTemp[11] = tDevinfo.BDTypeSn2>>8; 	
+						DataTemp[12] = tDevinfo.BDTypeSn2; 	
+						DataTemp[13] = tDevinfo.Rs1; 
+
+						printf("-------------------OnlineState: %d,%d-----------------------\n",dev_info.OnlineState,tDevinfo.DevState);
+
+						if(dev_info.OnlineState>0)
+							DataTemp[14] = dev_info.DevState; 
+						else
+							DataTemp[14] = 0xff; 
+							
+						DataTemp[15] = tDevinfo.Namelen; 	//名称长度
+						//if(tDevinfo.Namelen)
+						memcpy(&DataTemp[16],tDevinfo.Name,20);
+					
+						//通知所有手机
+						for(i=0;i<NetMenNum;i++)
+						{
+							//通知已经连接运行稳定的手机端
+							if(Devclient[i].fd > 0 && Devclient[i].cmd != GETALLDEVICELIST)
+							{
+								TcpSendData(Devclient[i].fd,NEWDEVICEADD,DataTemp,36);
+								usleep(1000);
+							}
+						}
+					}
+					
+					if(Sqlctl->sql_update_Devtable(db,DEV_INFO,dev_info.ShortAddr,dev_info.Endpoint,&dev_info)!=0)
+					{
+						printf("update data error\n");
+					}
+					
+				}
+				else
+				{	
+				
+					dev_info.Rs3 = 1;
+					if(Sqlctl->sql_insert_Devinfo(db,DEV_INFO,&dev_info)!=0)
+					{
+						printf("sql_insert_Devinfo error\n");
+						return;
+					}
+					
+				
+					usleep(100);
+					
+					//告诉手机 有新设备加入 liupeng add
+					FindDev(tDevinfo.ShortAddr,tDevinfo.Endpoint,&tDevinfo); //查询新插入的设备 
+					usleep(100);
+					
+					if(tDevinfo.Sn != -1)
+					{
+						DataTemp[0] = 1;//设备总数为1
+						DataTemp[1] = 0xB6;
+						DataTemp[2] = 33;
+						DataTemp[3] = tDevinfo.ShortAddr>>8; 	//短地址
+						DataTemp[4] = tDevinfo.ShortAddr;		//短地址
+						DataTemp[5] = tDevinfo.Endpoint; 		//从地址
+							
+						DataTemp[6] = IDfeibitome(tDevinfo.DeviceID,tDevinfo.ZoneType);		//设备ID
+						/*
+						printf("----------ShortAddr:%2X,Endpoint:%2X,deviceid:%2X,ZoneType:%2X,----------\n",tDevinfo.ShortAddr,\
+																											tDevinfo.Endpoint,\
+																											tDevinfo.DeviceID,\
+																											tDevinfo.ZoneType
+																												);
+																									
+							*/
+						DataTemp[7] = tDevinfo.BDType1; 	
+						DataTemp[8] = tDevinfo.BDTypeSn1>>8; 
+						DataTemp[9] = tDevinfo.BDTypeSn1; 
+						DataTemp[10] = tDevinfo.BDType2; 	
+						DataTemp[11] = tDevinfo.BDTypeSn2>>8; 	
+						DataTemp[12] = tDevinfo.BDTypeSn2; 	
+						DataTemp[13] = tDevinfo.Rs1; 
+
+						if(tDevinfo.OnlineState>0)
+							DataTemp[14] = tDevinfo.DevState; 
+						else
+							DataTemp[14] = 0xff; 
+							
+						DataTemp[15] = tDevinfo.Namelen; 	//名称长度
+						//if(tDevinfo.Namelen)
+						memcpy(&DataTemp[16],tDevinfo.Name,20);
+					
+						//通知所有手机
+						for(i=0;i<NetMenNum;i++)
+						{
+							//通知已经连接运行稳定的手机端
+							if(Devclient[i].fd > 0 && Devclient[i].cmd != GETALLDEVICELIST)
+							{
+								TcpSendData(Devclient[i].fd,NEWDEVICEADD,DataTemp,36);
+								usleep(1000);
+							}
+						}
+							 
+					}	
+					
+				}
+				/*
+				printf("Userinfo.Sn:%ld\n",Userinfo->Sn);
+				printf("Userinfo.FtState:%ld\n",Userinfo->FtState);
+				printf("Userinfo.SecState:%ld\n",Userinfo->SecState);
+				printf("Userinfo.PassWord:%ld\n",Userinfo->PassWord);
+				printf("Userinfo.AuthTime:%ld\n",Userinfo->AuthTime);
+				printf("Userinfo.AuthHoli:%ld\n",Userinfo->AuthHoli);
+				printf("Userinfo.StartRtc:%ld\n",Userinfo->StartRtc);
+				printf("Userinfo.EndRtc:%ld\n",Userinfo->EndRtc);
+				printf("Userinfo.Name:%s\n",Userinfo->Name);
+				printf("Userinfo.Addr:%s\n",Userinfo->Addr);
+				*/
+				//printf("2!\n");
+				break;
+			}
+			case 0x0B: 			//添加设备到组
+			{
+				DataTemp[0] = Data[3];
+				DataTemp[1] = Data[2];
+
+				DataTemp[2] = Data[4];
+				
+				memcpy(&DataTemp[3],&Data[5],Data[4]);
+				memcpy(strtmp,&Data[5],Data[4]);
+
+				strtmp[Data[4]] = '\0';
+
+				memcpy(tGroupinfo.Name,strtmp,Data[4]+1);
+				
+				FindGroup(GROUP_INFO,strtmp,&tGroupinfo);
+				printf("-----!name:%s\n",strtmp);
+				if(tGroupinfo.Rs1>0)
+				{
+					printf("----!Namelen:%d,Nature:%d\n",tGroupinfo.Namelen ,tGroupinfo.Nature);
+					printf("-----!1:%d,2:%d\n",Data[3] ,Data[2]);
+					tGroupinfo.Uid = (Data[3]<<8)+Data[2];
+					Sqlctl->sql_update_Grouptable(db,GROUP_INFO,strtmp,&tGroupinfo);
+				}
+				else
+				{
+					//Sqlctl->sql_insert_Groupinfo(db,GROUP_INFO,&tGroupinfo);
+					printf("-----no device!\n");
+				}
+
+				
+				
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].cmd ==ADDDEVICETOGROUP)
+					{
+						
+						break;
+					}
+				}
+				
+				TcpSendData(Devclient[i].fd,ADDDEVICETOGROUP,DataTemp,3+Data[4]);
+				break;
+			}
+			case 0x0C: 			//获取组列表
+			{
+				DataTemp[0] = Data[3];
+				DataTemp[1] = Data[2];
+				DataTemp[2] = Data[4];
+
+				memcpy(&DataTemp[3],&Data[5],Data[4]);
+
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].cmd ==GETGROUPLIST)
+					{
+						
+						break;
+					}
+				}
+				
+				TcpSendData(Devclient[i].fd,GETGROUPLIST,DataTemp,Data[4]+3);
+				break;
+			}
+			case 0x0F: 			//删除设备到组 16
+			{
+				DataTemp[0] = Data[3];
+				DataTemp[1] = Data[2];
+
+				DataTemp[2] = Data[4];
+
+				memcpy(&DataTemp[3],&Data[5],Data[4]);
+				
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].fd >0)
+					{
+						
+						
+						TcpSendData(Devclient[i].fd,DELETEDEVICEGROUP,DataTemp,3+Data[4]);
+					}
+				}
+				
+				
+				break;
+			}
+			case 0x10: 			//获取分组设备
+			{
+				DataTemp[0] = Data[3];
+				DataTemp[1] = Data[2];
+
+				DataTemp[2] = Data[4];
+
+				for(i=0;i<Data[4];i++)
+				{
+					DataTemp[3+i*3] = Data[6+i*3];
+					DataTemp[4+i*3] = Data[5+i*3];
+					DataTemp[5+i*3] = Data[7+i*3];
+				}
+				
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].cmd ==GETGROUPDEVICELIST)
+					{
+						
+						
+						break;		
+					}
+				}
+				
+				TcpSendData(Devclient[i].fd,GETGROUPDEVICELIST,DataTemp,3+Data[4]*3);
+				break;
+			}
+			case 0x0D: 				//增加场景
+			{
+				DataTemp[0] = Data[3];
+				DataTemp[1] = Data[2];
+
+				DataTemp[2] = Data[4];
+
+				memcpy(&DataTemp[3],&Data[5],Data[4]);
+				
+				memcpy(strtmp,&Data[5],Data[4]);
+				
+				strtmp[Data[4]] = '\0';
+
+				memcpy(tGroupinfo.Name,strtmp,Data[4]+1);
+				
+				FindGroup(SCENE_INFO,strtmp,&tGroupinfo);
+				
+				if(tGroupinfo.Rs1>0)
+				{
+					printf("Namelen:%d,Nature:%d\n",tGroupinfo.Namelen ,tGroupinfo.Nature);
+					printf("1:%d,2:%d\n",Data[3] ,Data[2]);
+					tGroupinfo.Uid = (Data[3]<<8)+Data[2];
+					Sqlctl->sql_update_Grouptable(db,SCENE_INFO,strtmp,&tGroupinfo);
+				}
+				else
+				{
+					//Sqlctl->sql_insert_Groupinfo(db,GROUP_INFO,&tGroupinfo);
+					printf("no device!\n");
+				}
+				
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].cmd ==ADDCJ)
+					{
+						
+						
+						break;		
+					}
+				}
+				
+				TcpSendData(Devclient[i].fd,ADDCJ,DataTemp,3+Data[4]);
+				break;
+			}
+			case 0x0E: 			//获取场景列表
+			{
+				DataTemp[0] = Data[3];
+				DataTemp[1] = Data[2];
+				DataTemp[2] = Data[4];
+
+				memcpy(&DataTemp[3],&Data[5],Data[4]);
+				DataTemp[3+Data[4]] = Data[5+Data[4]];
+
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].cmd ==GETCHANGJINGLIST)
+					{
+						
+						break;
+					}
+				}
+				
+				TcpSendData(Devclient[i].fd,GETCHANGJINGLIST,DataTemp,Data[4]+4);
+				break;
+			}
+			case 0x20: 			//获取场景设备信息
+			{
+				DataTemp[0] = Data[3];
+				DataTemp[1] = Data[2];
+
+				DataTemp[2] = Data[4];
+
+				for(i=0;i<Data[4];i++)
+				{
+					DataTemp[3+i*10] = Data[6+i*11];
+					DataTemp[4+i*10] = Data[5+i*11];
+					DataTemp[5+i*10] = Data[7+i*11];
+					devicetype = Data[8+i*11];
+					devicetype |= Data[9+i*11]<<8;
+
+					DataTemp[6+i*10] = IDfeibitome(devicetype,1);				//设备类型
+					DataTemp[7+i*10] = Data[10+i*11];
+					DataTemp[8+i*10] = Data[11+i*11];
+					DataTemp[9+i*10] = Data[12+i*11];
+					DataTemp[10+i*10] = Data[13+i*11];
+					
+					DataTemp[11+i*10] = Data[14+i*11];	//红外ID；
+					DataTemp[12+i*10] = Data[15+i*11];	//延时时间；
+
+					
+				}
+				
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].cmd ==GETONECJLIST)
+					{
+						
+						
+						break;		
+					}
+				}
+				
+				TcpSendData(Devclient[i].fd,GETONECJLIST,DataTemp,3+Data[4]*10);
+				break;
+			}
+			
+			case 0x21:	//删除场景设备或场景
+			{
+				DataTemp[0] = Data[3];
+				DataTemp[1] = Data[2];
+
+				DataTemp[2] = Data[4];
+
+				memcpy(&DataTemp[3],&Data[5],Data[4]);
+				
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].fd >0)
+					{
+						
+						TcpSendData(Devclient[i].fd,DELETECJ,DataTemp,3+Data[4]);
+						//break;		
+					}
+				}
+				
+				
+				break;
+			}
+			
+			case 0x22://添加任务返回  liupeng
+			{
+				pf("return  add task...");
+				jk=0;
+				for(k=0;k<Data[1]+2;k++) //liupeng . 打印出报文   0612
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)Data[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+				printf("\n");
+				if(Data[2] == 0x03)//传感任务
+				{
+					DataTemp[0] = Data[4];//task id
+					DataTemp[1] = Data[3];
+					
+					DataTemp[2] = Data[5];//task name len
+					
+					memcpy(&DataTemp[3],&Data[6],Data[5]);//name
+					
+					for(i=0;i<NetMenNum;i++) //liupeng add ,0521   //找到发送该命令的对应手机
+					{
+						if(Devclient[i].cmd == SETSENORRUNCJ)
+						{
+							break;
+						}
+					}
+					
+					TcpSendData(Devclient[i].fd,SETSENORRUNCJ,DataTemp,3+Data[5]); //添加任务返回 新任务的ID
+				
+					printf("andy,create new task.. \n");
+				}else if(Data[2] == 0x01) //定时任务
+				{
+					DataTemp[0] = Data[4];//task id
+					DataTemp[1] = Data[3];
+					
+					DataTemp[2] = Data[5];//task name len
+					
+					memcpy(&DataTemp[3],&Data[6],Data[5]);//name
+					
+					for(i=0;i<NetMenNum;i++) //liupeng add ,0521   //找到发送该命令的对应手机
+					{
+						if(Devclient[i].cmd == ADDTIMERTASK)
+						{
+							break;
+						}
+					}
+					
+					TcpSendData(Devclient[i].fd,ADDTIMERTASK,DataTemp,3+Data[5]); //添加任务返回 新任务的ID
+				
+					pf("andy,create new Timer task.. \n");
+				}
+				break;			
+			}
+			case 0x23://删除任务 返回 liupeng
+			{
+				pf("return delete task...");
+				jk=0;
+				for(k=0;k<Data[1];k++) //liupeng . 打印出报文
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)Data[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+				
+				DataTemp[0] = Data[2]; //name len
+				memcpy(&DataTemp[1],&Data[3],Data[2]);//name
+				
+				int len = 1+Data[2];
+				DataTemp[len] = Data[4+Data[2]];//id
+				DataTemp[len+1] = Data[3+Data[2]];
+				
+				for(i=0;i<NetMenNum;i++) //liupeng add ,0521   //找到发送该命令的对应手机
+				{
+					if(Devclient[i].cmd == DELETETASK)
+					{
+						break;
+					}
+				}
+				
+				TcpSendData(Devclient[i].fd,DELETETASK,DataTemp,len+2);
+				
+				printf("andy,delete task...\n");
+				break;
+			}
+			case 0x24://获取指定任务详情 返回 //liupeng
+			{
+				pf("return get task info...");
+				jk=0;
+				for(k=0;k<Data[1]+2;k++) //liupeng . 打印出报文
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)Data[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+				int len = Data[1]+2;
+				
+				DataTemp[0] = Data[len-1]; //task id
+				DataTemp[1] = Data[len-2];
+				
+				DataTemp[2] = Data[48];//task name len
+				if(Data[48]>0)
+				   memcpy(&DataTemp[3],&Data[49],Data[48]);//task name len
+				
+				int len2 = 3+Data[48];
+				DataTemp[len2] = Data[2];//task type   liupeng 0525
+				
+				memcpy(&DataTemp[len2+1],&Data[3],19);//触发条件 liupeng modify 0525
+				
+				int len3 = len2+20;
+				DataTemp[len3] = Data[22]; //执行类型  liupeng modify 0525
+				DataTemp[len3+1] = Data[24];//id liupeng modify 0525
+				DataTemp[len3+2] = Data[23];// liupeng modify 0525
+				
+				for(i=0;i<NetMenNum;i++) //liupeng add ,0521   //找到发送该命令的对应手机
+				{
+					if(Devclient[i].cmd == GETTASKINFO)
+					{
+						break;
+					}
+				}
+				
+				TcpSendData(Devclient[i].fd,GETTASKINFO,DataTemp,len3+3);
+				
+				printf("andy,get task info...\n");
+				
+				break;
+			}
+			case 0x25://获取任务列表 liupeng
+			{
+				pf("return get task list....");
+				jk=0;
+				for(k=0;k<Data[1];k++) //liupeng . 打印出报文
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)Data[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+			
+				
+				DataTemp[0] = Data[2]; //任务类型
+				
+				DataTemp[1] = Data[4];//任务ID
+				DataTemp[2] = Data[3];
+				
+				DataTemp[3] = Data[5];//长度
+				memcpy(&DataTemp[4],&Data[6],Data[5]);
+				
+				DataTemp[4+Data[5]] = Data[Data[5]+6]; //total task count.
+				
+				for(i=0;i<NetMenNum;i++) //liupeng add ,0521   //找到发送该命令的对应手机
+				{
+					if(Devclient[i].cmd == GETALLTASKLIST)
+					{
+						break;
+					}
+				}
+				
+				TcpSendData(Devclient[i].fd,GETALLTASKLIST,DataTemp,5+Data[5]);
+				
+				break;
+			}
+			case 0x27: //获取灯的色温
+			{
+				if(Data[1] == 0x05)
+				{
+					DataTemp[0] = Data[3];
+					DataTemp[1] = Data[2];
+					DataTemp[2] = Data[4];
+					DataTemp[3] = Data[6];
+					DataTemp[4] = Data[5];
+					
+					for(i=0;i<NetMenNum;i++)
+					{
+						if(Devclient[i].cmd == GETLIGHTCOLORTEMP)
+						{
+							
+							break;
+						}
+					}
+					
+					TcpSendData(Devclient[i].fd,GETLIGHTCOLORTEMP,DataTemp,5);
+				}
+			}
+			
+			case 0x29:	
+			{
+
+				if(Data[2]==0x4&&Data[3]==0x82)//控制设备开关停
+				{
+				
+					DataTemp[0] = 'O';
+
+					for(i=0;i<NetMenNum;i++)
+					{
+						if(Devclient[i].cmd == CTRLSWITCH)
+						{
+							
+							break;
+						}
+					}
+					
+					TcpSendData(Devclient[i].fd,CTRLSWITCH,DataTemp,1);
+					break;
+				}else if(Data[2] == 0x04 && Data[3] == 0xA8) //设置色温 0603
+				{
+					DataTemp[0] = 'O';
+
+					for(i=0;i<NetMenNum;i++)
+					{
+						if(Devclient[i].cmd == SETLIGHTCOLORTEMP)
+						{
+							
+							break;
+						}
+					}
+					
+					TcpSendData(Devclient[i].fd,SETLIGHTCOLORTEMP,DataTemp,1);
+					break;
+				}
+				else if(Data[2] == 0x04 && Data[3] == 0x83) //设置亮度 0602
+				{
+					DataTemp[0] = 'O';
+
+					for(i=0;i<NetMenNum;i++)
+					{
+						if(Devclient[i].cmd == SETLIGHTLEVEL)
+						{
+							
+							break;
+						}
+					}
+					
+					TcpSendData(Devclient[i].fd,SETLIGHTLEVEL,DataTemp,1);
+					break;
+				}else if(Data[2] == 0x04 && Data[3] == 0x84) //设置颜色 0602
+				{
+					DataTemp[0] = 'O';
+
+					for(i=0;i<NetMenNum;i++)
+					{
+						if(Devclient[i].cmd == SETLIGHTCOLOR)
+						{
+							
+							break;
+						}
+					}
+					
+					TcpSendData(Devclient[i].fd,SETLIGHTCOLOR,DataTemp,1);
+					break;
+				}
+				else if(Data[2]==0x4&&Data[3]==0x95)//删除设备
+				{
+					DataTemp[0] = 'O';
+					
+					//DorpTable(DEV_INFO);		//清空数据库
+					//CreateTable(DEV_INFO);
+					
+					for(i=0;i<NetMenNum;i++)
+					{
+						if(Devclient[i].fd >0)
+						{
+							TcpSendData(Devclient[i].fd,DELETEDEVICE,DataTemp,1);
+							//break;
+						}
+					}
+					break;
+					
+				}
+				else if(Data[2]==0x4&&Data[3]==0x92)//运行场景；
+				{
+				
+					DataTemp[0] = 'O';
+
+					for(i=0;i<NetMenNum;i++)
+					{
+						if(Devclient[i].cmd ==RUNCJ)
+						{
+							
+							break;
+						}
+					}
+				
+					TcpSendData(Devclient[i].fd,RUNCJ,DataTemp,1);
+					break;
+				}
+				else if(Data[2]==0x4&&Data[3]==0xA1)//命令 A1 清空数据库；
+				{
+				
+					DorpTable(DEV_INFO);
+					CreateTable(DEV_INFO);
+
+					DorpTable(GROUP_INFO);
+					CreateTable(GROUP_INFO);
+
+					DorpTable(SCENE_INFO);
+					CreateTable(SCENE_INFO);
+					
+					Para->SetFlag = 0;
+					SetSysPara(Para);
+					
+					for(i=0;i<NetMenNum;i++)
+					{
+						if(Devclient[i].fd > 0)
+						{
+							DataTemp[0] = 'O';
+							TcpSendData(Devclient[i].fd,HUIFUGAWYSET,DataTemp,1);
+							
+						}
+					}
+
+					
+					printf("HUIFUGAWYSET\n");
+					printf("-----------------------Device reboot!-------------------\n");
+					sync(); // 同步磁盘数据,将缓存数据回写到硬盘,以防数据丢失[luther.gliethttp]
+					sleep(2);
+					
+	    			reboot(RB_AUTOBOOT);
+					
+					break;
+				}
+				else if(Data[2]==0x3)//设置设备名字
+				{
+					DataTemp[0] = Data[4];
+					DataTemp[1] = Data[3];
+
+					DataTemp[2] = Data[5];
+					
+					DataTemp[3] = Data[6];
+					memcpy(&DataTemp[4],&Data[7],Data[6]);
+					
+
+					for(i=0;i<NetMenNum;i++)
+					{
+						if(Devclient[i].fd > 0)
+						{
+							TcpSendData(Devclient[i].fd,SETDEVICENAME,DataTemp,1);
+							//break;
+						}
+					}
+					
+					
+					break;
+				}
+				else if(Data[2] == 0xA7){//liupeng 获取网关红外数据
+				pf("return get all ir data...");
+				jk=0;
+					for(k=0;k<(Data[1]+2);k++) //liupeng . 打印出报文
+				{
+					jk+=sprintf(andyBuf+jk,"%2X ",(unsigned char)Data[k]);
+					
+				}
+				andyBuf[jk+1]='\0';
+				pf(andyBuf);
+					DataTemp[0] = Data[11];//name len   0527
+					memcpy(&DataTemp[1],&Data[12],Data[11]);//name 0527
+					
+					int len = 1+Data[11];
+					DataTemp[len] = Data[10];//ir id  0527
+					DataTemp[len+1] = Data[9];
+					
+					for(i=0;i<NetMenNum;i++) //liupeng add ,0521   //找到发送该命令的对应手机
+					{
+						if(Devclient[i].cmd == GETALLIRDATA)
+						{
+							break;
+						}
+					}
+					
+					TcpSendData(Devclient[i].fd,GETALLIRDATA,DataTemp,len+2);
+				}
+				
+			}
+			case 0x07://获取设备状态
+			{
+				DataTemp[0] = Data[3];
+				DataTemp[1] = Data[2];
+
+				ShortAddr = Data[3]<<8;
+				ShortAddr |= Data[2];
+				
+				Endpoint=DataTemp[2] = Data[4];
+
+			 	DataTemp[3] = Data[5];
+			 	//printf("15\n");
+				memset(&tDevinfo,0,sizeof(tDevinfo));
+			 	FindDev(ShortAddr,Endpoint,&tDevinfo);
+
+				if(tDevinfo.Sn != -1) 
+				{
+
+					if(tDevinfo.DevState!=Data[5])
+					{
+						//tDevinfo.Rs3 = Data[5];
+						tDevinfo.DevState = Data[5];
+						
+						if(Sqlctl->sql_update_Devtable(db,DEV_INFO,ShortAddr,Endpoint,&tDevinfo)!=0)
+						{
+							printf("update data error\n");
+						}
+						usleep(1000);
+					}
+					else
+						break;
+				}
+				else
+					break;
+				
+				
+				printf("updata state!\n");
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].fd >0)
+					{
+						TcpSendData(Devclient[i].fd,GETDEVICESTATE,DataTemp,4);
+						usleep(2000);
+					}
+				}
+				break;
+
+			}
+			
+			case 0x08: //获取亮度
+			{
+				DataTemp[0] = Data[3];
+				DataTemp[1] = Data[2];
+
+				ShortAddr = Data[3]<<8;
+				ShortAddr |= Data[2];
+				
+				Endpoint=DataTemp[2] = Data[4];
+
+			 	DataTemp[3] = Data[5]; //亮度
+				
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].cmd == GETLIGHTLEVEL)
+					{
+						break;
+					}
+				}
+				TcpSendData(Devclient[i].fd,GETLIGHTLEVEL,DataTemp,4);
+				break;
+			
+				
+			}
+			case 0x09: //获取颜色
+			{
+				DataTemp[0] = Data[3];
+				DataTemp[1] = Data[2];
+
+				ShortAddr = Data[3]<<8;
+				ShortAddr |= Data[2];
+				
+				Endpoint=DataTemp[2] = Data[4];
+
+			 	DataTemp[3] = Data[5]; //颜色
+				
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].cmd == GETLIGHTCOLOR)
+					{
+						break;
+					}
+				}
+				TcpSendData(Devclient[i].fd,GETLIGHTCOLOR,DataTemp,4);
+				break;
+			
+				
+			}
+			case 0x0a: //获取饱和度
+			{
+				DataTemp[0] = Data[3];
+				DataTemp[1] = Data[2];
+
+				ShortAddr = Data[3]<<8;
+				ShortAddr |= Data[2];
+				
+				Endpoint=DataTemp[2] = Data[4];
+
+			 	DataTemp[3] = Data[5]; //baohedu
+				
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].cmd == GETLIGHTSATURATION)
+					{
+						break;
+					}
+				}
+				TcpSendData(Devclient[i].fd,GETLIGHTSATURATION,DataTemp,4);
+				break;
+			
+				
+			}
+			case 0x70://传感器上报 28
+			{
+				memcpy(DataTemp,&Data[2],Data[1]);
+
+				FindDev((Data[3]<<8)+Data[2],Data[4],&tDevinfo);
+				printf("11-------bf--------:%d\n",tDevinfo.Rs3);
+
+				
+
+
+				if(tDevinfo.Sn != -1) 
+				{
+					printf("-------bf--------:%d\n",tDevinfo.Rs3);
+					if(!tDevinfo.Rs3)
+					break;
+					
+				}
+				else
+				{	
+					//break;
+				}
+				printf("!!!!!!!!!!---bf-----:%d\n",Para->BfCfflag);
+
+				if(tDevinfo.DeviceID==0x0402)
+				{
+					if(Para->BfCfflag!=2)
+						Para->BfCfflag = 1;
+					printf("-------------bf--23:%d\n",Para->BfCfflag);
+				}
+				
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].fd >0)
+					{
+						TcpSendData(Devclient[i].fd,SENORTOAPP,DataTemp,Data[1]);
+						usleep(10000);
+					}
+				}
+				
+				break;
+
+			}
+			case 0x31://获取绑定场景
+			{
+				//memcpy(&DataTemp[0],&Data[2],Data[1]);
+				if(Data[7]==0x01) 	
+				{
+					DataTemp[0] = Data[2];
+					DataTemp[1] = Data[4];
+					DataTemp[2] = Data[3];
+					DataTemp[3] = Data[5];
+					DataTemp[4] = Data[7];
+					DataTemp[5] = Data[9];
+					
+				}
+				else
+				{
+					DataTemp[0] = Data[2];
+					DataTemp[1] = Data[4];
+					DataTemp[2] = Data[3];
+					DataTemp[3] = Data[5];
+					DataTemp[4] = Data[7];
+					DataTemp[5] = Data[8];
+
+					for(i=0;i<Data[8];i++)
+					{
+						DataTemp[6+i*3] = Data[9+i*3];
+						DataTemp[7+i*3] = Data[10+i*3];
+						DataTemp[8+i*3] = Data[11+i*3];
+					}
+				
+				}
+				
+			
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].cmd == 0XA9)
+					{
+						if(Data[7]==0x01)
+						TcpSendData(Devclient[i].fd,0xA9,DataTemp,6);
+						else
+						TcpSendData(Devclient[i].fd,0xA9,DataTemp,6+Data[8]*3);
+						break;
+					}
+				}
+				
+			
+				break;
+
+			}
+			
+			default:
+			{
+				
+				break;
+			}
+					
+		}
+		//printf("1!\n");
+	}
+	else 
+	{
+			
+	}
+
+}
+
+
+int PcTxTimeMalloc(void)
+{
+	PcTxTime = malloc(sizeof(T_pcTxTime));
+}
+
+void PcTxTimeFree(void)
+{
+	free(PcTxTime);
+}
+
+PT_pcTxTime GetPcTxTime(void)
+{
+	return PcTxTime;
+}
+
+
+
+void RegGawyToServer(void)
+{
+	PT_NetDeviceOpr server;
+	PT_Sys_Para_Opr Para;
+	unsigned char DataTemp[250];
+	Para = GetDefultSysParaOpr();
+	
+	
+	server = GetNetDeviceOpr("tcp_client");
+	//网关SN（4B）+密码长度（1B）+密码+网关名称长度（1b）+网关名称
+	
+	DataTemp[0] = Para->GatewaySn>>24;
+	DataTemp[1] = Para->GatewaySn>>16;
+	DataTemp[2] = Para->GatewaySn>>8;
+	DataTemp[3] = Para->GatewaySn;
+	printf("SnID:%x\n",Para->GatewaySn);
+	DataTemp[4] = Para->Passwordlen;
+	memcpy(&DataTemp[5],Para->Password,Para->Passwordlen);
+	
+	DataTemp[5+Para->Passwordlen] = Para->Device_NameLen;
+	
+	memcpy(&DataTemp[6+Para->Passwordlen],Para->DeviceName,Para->Device_NameLen);
+	
+	TcpSendData(server->fd,0xFA,DataTemp,6+Para->Device_NameLen+Para->Passwordlen);
+}
+
+/** 通知服务器网关名称或者密码已经修改
+**/
+void notifyServerGatewayInfoChange(void)
+{
+	PT_NetDeviceOpr server;
+	PT_Sys_Para_Opr Para;
+	unsigned char DataTemp[250];
+	Para = GetDefultSysParaOpr();
+	
+	
+	server = GetNetDeviceOpr("tcp_client");
+	//网关SN（4B）+密码长度（1B）+密码+网关名称长度（1b）+网关名称
+	
+	DataTemp[0] = Para->GatewaySn>>24;
+	DataTemp[1] = Para->GatewaySn>>16;
+	DataTemp[2] = Para->GatewaySn>>8;
+	DataTemp[3] = Para->GatewaySn;
+	printf("SnID:%x\n",Para->GatewaySn);
+	DataTemp[4] = Para->Passwordlen;
+	memcpy(&DataTemp[5],Para->Password,Para->Passwordlen);
+	
+	DataTemp[5+Para->Passwordlen] = Para->Device_NameLen;
+	
+	memcpy(&DataTemp[6+Para->Passwordlen],Para->DeviceName,Para->Device_NameLen);
+	
+	TcpSendData(server->fd,0xAE,DataTemp,6+Para->Device_NameLen+Para->Passwordlen);
+}
+
+static void *Thread_Shake_hands(void *param)
+{
+	unsigned char Temp[7];
+	int i;
+	unsigned char DataTemp[20];
+	int iError;
+	unsigned char sqltemp[15];
+	unsigned char *sql = "%d.%d.%d.%d";
+	PT_pcTxTime PCTx;
+
+	PT_NetDeviceOpr ptNetDeviceOpr;
+	int len;
+	PT_TCPWROpr ptTmp;
+	PT_Sys_Para_Opr Para;
+
+
+	PT_NetDeviceOpr server;
+	
+	Para = GetDefultSysParaOpr();
+
+	server = GetNetDeviceOpr("tcp_client");
+			
+	ptNetDeviceOpr = GetNetDeviceOpr("zll");
+	
+	ptTmp = GetNetOpr("netdevice");
+		
+	PCTx = GetPcTxTime();
+
+	while(1)
+	{
+		usleep(50000);
+		
+		if(PCTx->PC_TX_SendFlag)
+		{	
+			gettime(Temp);
+			
+			for(i=0;i<7;i++)
+				Temp[i]=HEX_BCD(Temp[i]);
+			
+			PCTx->PC_TX_SendFlag = 0;
+			
+			//Up_Charge_Info();
+			//Up_Event_Info();
+			//Can_Tcp_TX_To_PC(SHAKE_HANDS_PC,Temp,7);
+			//W5100_Socket_Set();
+			PCTx->PC_TX_Out_En = 1;
+			PCTx->PC_TX_Time_Out = PC_ACK_TIME;
+
+			DataTemp[0] = 0x0;
+			
+			printf("send to server fd:%d\n",server->fd);
+			TcpSendData(server->fd,0xFB,DataTemp,1);
+			
+			
+			if(ptNetDeviceOpr)
+			{	
+				DataTemp[0] = 0x08;  		//08 00 FF FF FF FF FE 81 
+				DataTemp[1] = 0;
+				DataTemp[2] = Para->DeviceSn[3];
+				DataTemp[3] = Para->DeviceSn[2];
+				DataTemp[4] = Para->DeviceSn[1];
+				DataTemp[5] = Para->DeviceSn[0];
+				DataTemp[6] = 0xFE;
+				DataTemp[7] = 0x81;
+				//printf("GETfeibiALLDEVICELIST:fd:%d,%x%x%x%x,\n",ptNetDeviceOpr->fd,Para->DeviceSn[0],Para->DeviceSn[1],Para->DeviceSn[2],Para->DeviceSn[3]) ;
+				
+				ptTmp->Write(ptNetDeviceOpr->fd,DataTemp,8);
+			}
+			//ShowNetMem();
+		}
+		else if(PCTx->PC_TX_Out_En)						
+		{
+			if(!PCTx->PC_TX_Time_Out)
+			{
+				PCTx->PC_TX_Time_Out = PC_ACK_TIME;
+				PCTx->PC_TX_Out_En = 0;
+
+				PCTx->PC_TX_OutNumber ++;
+				
+				if(PCTx->PC_TX_OutNumber>=PC_ACK_OUTRST)
+				{
+					PCTx->PC_TX_OutNumber = 0;
+					PCTx->PC_TX_Out_En = 0;
+					PCTx->PC_TX_Time_Out = PC_ACK_TIME;
+					PCTx->PC_TX_SendFlag = 0;
+					
+					printf("Reconnect server\n");
+					iError=InitTcpClient("tcp_client");
+					
+					//网关SN（4B）+密码长度（1B）+密码+网关名称长度（1b）+网关名称
+					
+					RegGawyToServer();
+					
+					//ShowNetMem();
+					//printf("iError:%d\n",iError);
+
+					//iError=InitTcpClient("zll");
+					
+					//printf("aaaaa\n");
+					//close(sockfd_client);
+					//shutdown(sockfd_client, SHUT_RDWR);
+					//sprintf(sqltemp,sql,Para.DIP_Addr[0],Para.DIP_Addr[1],Para.DIP_Addr[2],Para.DIP_Addr[3]);
+					
+				
+				}
+			}
+		}
+	}
+}
+
+char getsn(char string)
+{
+	if((string>0x60)&&(string<0x67))
+	{
+		return string - 0x57;
+	}
+	else if((string>0x2F)&&(string<0x3A))
+	{
+		return string - 0x30;
+	}
+	
+}
+
+
+int GetZllSN(char *recvBuffer)
+{
+    char sentbuf[20];
+    int sock; 
+    struct sockaddr_in servaddr;
+    struct sockaddr_in fromAddr;
+
+     unsigned int fromLen;
+    
+
+	memcpy(sentbuf,"GETIP/r/n",9);
+    sock = socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
+    
+    memset(&servaddr,0,sizeof(servaddr));
+    
+    servaddr.sin_family=AF_INET;
+    servaddr.sin_addr.s_addr=inet_addr("127.0.0.1");
+    servaddr.sin_port = htons(9090);
+    if(sendto(sock,sentbuf,9,0,(struct sockaddr*)&servaddr,sizeof(servaddr)) != 9)
+    {
+         perror("sendto error"); 
+         close(sock);
+         exit(1);
+    }
+    usleep(10000);
+    
+    fromLen = sizeof(fromAddr);
+    if(recvfrom(sock,recvBuffer,1024,0,(struct sockaddr*)&fromAddr,&fromLen)<0)
+    {
+         perror("recvfrom error"); 
+         close(sock);
+         return -1;
+    }
+
+    printf("%s",recvBuffer);
+   
+    close(sock);
+    return 0;
+}
+
+static void *Thread_Beepworning(void *param)
+{
+	
+	int val;
+	int i;
+	static int conut,Beepcount;
+	unsigned char DataTemp[20];
+	PT_TCPWROpr ptTmp;
+	PT_NetDeviceOpr ptNetDeviceOpr;
+	PT_Sys_Para_Opr Para;
+
+	
+	Para = GetDefultSysParaOpr();
+	PT_IOctlOpr temp = GetIOctlOpr("beepctl");
+
+	//val = temp->IOread(0);
+	if(temp)
+	{
+		Beepcount = 0;
+		conut = 0;
+		
+		for (;;) 
+		{
+			
+			temp->IOctl(0,0,0);
+			usleep(300000);
+			temp->IOctl(0,1,0);
+			usleep(300000);
+			conut++;
+			
+			if(conut>=20)
+			{
+				conut = 0;
+				Beepcount++;
+				if(Beepcount>=50)
+				{
+					Beepcount = 0;
+					Para->BfCfflag = 0;
+				}
+				
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].fd >0)
+					{
+						DataTemp[0] = 1;
+						TcpSendData(Devclient[i].fd,SENERCALSET,DataTemp,1);
+					}
+				}
+			}
+
+			if(Para->BfCfflag==0)
+			{
+				//Para->BfCfflag=2;
+
+				SetSysPara(Para);
+
+				for(i=0;i<NetMenNum;i++)
+				{
+					if(Devclient[i].fd >0)
+					{
+						DataTemp[0] = 2;
+						TcpSendData(Devclient[i].fd,SENERCALSET,DataTemp,1);
+					}
+				}
+
+				
+				break;
+			}
+		}
+	}
+	
+	
+}
+
+
+void BeepWorning(void)
+{
+	PT_Sys_Para_Opr Para;
+	pthread_t thr_id;
+
+	
+	Para = GetDefultSysParaOpr();
+	//Para->BfCfflag=1;
+
+	if(Para->BfCfflag==1)
+	{
+		Para->BfCfflag = 2;
+		if (pthread_create(&thr_id, NULL, &Thread_Beepworning, NULL)) {
+			return (SNL_ERR_LISTEN);
+		}
+		
+		if (pthread_detach(thr_id)) {
+			return (SNL_ERR_LISTEN);
+		}
+	}
+}
+
+
+void Hand(void)
+{
+	pthread_t thr_id;
+
+	if (pthread_create(&thr_id, NULL, &Thread_Shake_hands, NULL)) {
+		return (SNL_ERR_LISTEN);
+	}
+	
+	if (pthread_detach(thr_id)) {
+		return (SNL_ERR_LISTEN);
+	}
+	
+}
+
+
+
+/*
+int GetzlludpData(void)
+{
+	PT_Sys_Para_Opr Para;
+	char temp;
+	int received,i;
+	char recvBuffer[30];
+
+	Para = GetDefultSysParaOpr();
+
+	while(1)
+	{
+		if(GetZllSN(recvBuffer)==0)
+		{
+			temp = getsn(recvBuffer[3]);
+			Para->DeviceSn[0] = temp<<4;
+			Para->DeviceSn[0] |= getsn(recvBuffer[4]);
+			
+			temp = getsn(recvBuffer[5]);
+			Para->DeviceSn[1] = temp<<4;
+			Para->DeviceSn[1] |= getsn(recvBuffer[6]);
+
+			temp = getsn(recvBuffer[7]);
+			Para->DeviceSn[2] = temp<<4;
+			Para->DeviceSn[2] |= getsn(recvBuffer[8]);
+
+			temp = getsn(recvBuffer[9]);
+			Para->DeviceSn[3] = temp<<4;
+			Para->DeviceSn[3] |= getsn(recvBuffer[10]);
+
+			//for(i=0;i<4;i++)
+			//	printf("%d ",Para->DeviceSn[i]);
+
+			SetSysPara(Para);
+			break;
+		}
+	}
+}
+
+*/
+
+

@@ -1,0 +1,1 @@
+obj-y += alloc_manager.o
