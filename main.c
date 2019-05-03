@@ -390,13 +390,13 @@ int main(int argc, char **argv)
 		//BeepWorning();					//处理蜂鸣器报警事件；
 //		printf("run\r\n");
 		Rx_OCU_Prs(&tRxOcu);
-		Rx_ARM_Prs(&tARMBoard);
+//		Rx_ARM_Prs(&tARMBoard);
 		motion_send();
 		Rx_Head_Prs(&tHeadBoard);
 		Rx_Motion_Prs(&tTack);
 //		canopen_data_pro();
 		canopen_data_pro(&tHeadBoard,&tARMBoard,&tTack);
-		usleep(2000);
+		usleep(1000);
 		Rx_Ptz_Prs(&tPtz);
 		Tacker_To_Ocu(&tHeadBoard,&tARMBoard);  //车体数据返回OCU
 		//timingCheck();
